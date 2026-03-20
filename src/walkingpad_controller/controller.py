@@ -13,8 +13,11 @@ Example usage:
     controller = WalkingPadController(ble_device=device)
     await controller.connect()
 
-    # Start at 3.0 km/h
-    await controller.start(target_speed=3.0)
+    # Start the belt (runs at minimum speed)
+    await controller.start()
+
+    # Set desired speed via the speed slider / set_speed()
+    await controller.set_speed(3.0)
 
     # Get status
     print(controller.status)
@@ -40,7 +43,6 @@ from .const import (
     MAX_CONNECT_RETRIES,
     RETRY_DELAY_SECONDS,
     WILINK_SERVICE_UUID,
-    BeltState,
     OperatingMode,
     ProtocolType,
 )
@@ -75,11 +77,6 @@ class WalkingPadController:
         # Status callbacks
         self._status_callbacks: list[Callable[[TreadmillStatus], None]] = []
         self._disconnect_callbacks: list[Callable[[], None]] = []
-
-        # Pending target speed for FTMS cold-start recovery.
-        # When a cold START_OR_RESUME causes a BLE drop, we store the desired
-        # speed here so it can be re-sent after reconnection.
-        self._pending_target_speed: float | None = None
 
         # Eagerly detect protocol from BLE name
         name_protocol = self._detect_protocol_from_name()
@@ -167,44 +164,6 @@ class WalkingPadController:
                 cb(status)
             except Exception:
                 _LOGGER.exception("Error in status callback")
-
-        # FTMS cold-start recovery: if the belt is running at min speed
-        # but we have a pending target speed, re-send it.
-        if (
-            self._pending_target_speed is not None
-            and self._ftms
-            and self._ftms.connected
-        ):
-            if status.speed > 0 and status.speed < self._pending_target_speed - 0.15:
-                pending = self._pending_target_speed
-                self._pending_target_speed = None
-                _LOGGER.info(
-                    "Applying pending target speed %.1f km/h (belt at %.1f after reconnect)",
-                    pending,
-                    status.speed,
-                )
-                asyncio.ensure_future(self._apply_pending_speed(pending))
-            elif abs(status.speed - self._pending_target_speed) <= 0.15:
-                _LOGGER.debug(
-                    "Pending target speed %.1f reached, clearing",
-                    self._pending_target_speed,
-                )
-                self._pending_target_speed = None
-
-    async def _apply_pending_speed(self, speed: float) -> None:
-        """Apply a pending target speed after reconnection."""
-        try:
-            if self._ftms and self._ftms.connected:
-                _LOGGER.info("Re-sending SET_TARGET_SPEED(%.1f) after reconnect", speed)
-                result = await self._ftms.set_target_speed(speed)
-                if result:
-                    _LOGGER.info("SET_TARGET_SPEED(%.1f) applied successfully", speed)
-                else:
-                    _LOGGER.warning(
-                        "SET_TARGET_SPEED(%.1f) failed after reconnect", speed
-                    )
-        except BleakError as err:
-            _LOGGER.warning("BLE error applying pending speed: %s", err)
 
     def _on_disconnect(self) -> None:
         """Internal handler for disconnect events from either backend."""
@@ -346,43 +305,25 @@ class WalkingPadController:
 
     # --- Commands ---
 
-    async def start(self, target_speed: float | None = None) -> bool:
-        """Start the treadmill.
+    async def start(self) -> bool:
+        """Start the treadmill belt.
 
-        For FTMS devices, this uses START_OR_RESUME (cold start) followed by
-        SET_TARGET_SPEED with retry logic. For WiLink devices, this sends the
-        standard start command.
+        For FTMS devices, sends START_OR_RESUME and waits for the belt
+        to begin moving.  Does NOT send SET_TARGET_SPEED — the user
+        must set speed explicitly via set_speed() (e.g. the HA speed
+        slider).  Sending a speed command during motor spin-up crashes
+        the BLE connection on KingSmith firmware.
 
-        If the BLE connection drops during a cold start (common on KingSmith
-        FTMS devices), the target speed is stored as "pending" and will be
-        automatically re-applied after reconnection.
-
-        Args:
-            target_speed: Target speed in km/h. If None, uses min speed.
+        For WiLink devices, sends the standard start command.
 
         Returns:
             True if the belt is running. False if the connection was lost.
         """
         if self._ftms:
-            # Store pending speed BEFORE calling start (BLE may drop)
-            if target_speed is not None and target_speed > self._ftms.min_speed:
-                self._pending_target_speed = target_speed
-
-            result = await self._ftms.start(target_speed=target_speed)
-
-            if result and self._ftms.connected:
-                if target_speed and abs(self._ftms.status.speed - target_speed) > 0.15:
-                    _LOGGER.info(
-                        "start() completed but speed is %.1f (target %.1f), keeping pending",
-                        self._ftms.status.speed,
-                        target_speed,
-                    )
-                else:
-                    self._pending_target_speed = None
-            return result
+            return await self._ftms.start()
 
         elif self._wilink:
-            return await self._wilink.start(target_speed=target_speed)
+            return await self._wilink.start()
 
         _LOGGER.warning("No protocol backend available")
         return False
@@ -393,8 +334,6 @@ class WalkingPadController:
         Returns:
             True if the command was sent successfully.
         """
-        self._pending_target_speed = None
-
         if self._ftms:
             return await self._ftms.stop()
         elif self._wilink:
@@ -406,7 +345,9 @@ class WalkingPadController:
     async def set_speed(self, speed_kmh: float) -> bool:
         """Set the treadmill speed.
 
-        If the belt is stopped, this will start it first (FTMS only).
+        If the belt is already running, sends SET_TARGET_SPEED directly.
+        If the belt is stopped, starts it first (the belt will run at
+        minimum speed until the user adjusts the speed slider).
 
         Args:
             speed_kmh: Target speed in km/h.
@@ -416,15 +357,20 @@ class WalkingPadController:
         """
         if self._ftms:
             if self._ftms.status.speed > 0:
+                # Belt already running — safe to send speed directly
                 return await self._ftms.set_target_speed(speed_kmh)
             else:
-                # Belt is stopped, need full start sequence
-                if speed_kmh > self._ftms.min_speed:
-                    self._pending_target_speed = speed_kmh
-                result = await self._ftms.start(target_speed=speed_kmh)
-                if result and self._ftms.connected:
-                    self._pending_target_speed = None
-                return result
+                # Belt is stopped — start it first.  The user will need
+                # to set the desired speed once the belt is running.
+                _LOGGER.info(
+                    "Belt is stopped — starting first, then setting speed %.1f",
+                    speed_kmh,
+                )
+                started = await self._ftms.start()
+                if not started:
+                    return False
+                # Belt is now running; send the speed command
+                return await self._ftms.set_target_speed(speed_kmh)
 
         elif self._wilink:
             return await self._wilink.set_target_speed(speed_kmh)

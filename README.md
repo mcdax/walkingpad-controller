@@ -9,7 +9,7 @@ Supports both **FTMS** (Fitness Machine Service) and legacy **WiLink** protocols
 - **Unified API** — single `WalkingPadController` class for all device types
 - **Auto protocol detection** — FTMS for newer KS-HD-* devices, WiLink for older models
 - **Real-time status** — speed, distance, duration, calories, steps via BLE notifications
-- **Cold-start handling** — retry logic for KingSmith FTMS devices that need START_OR_RESUME before accepting speed commands
+- **Cold-start handling** — waits for belt to start moving and stabilize before sending speed commands, avoiding BLE disconnects on KingSmith devices
 - **Reconnect recovery** — pending target speed is automatically re-applied after BLE reconnection
 - **KingSmith extensions** — step counter via proprietary FTMS extension (bit 13)
 
@@ -44,8 +44,11 @@ async def main():
     print(f"Protocol: {controller.protocol.value}")
     print(f"Speed range: {controller.min_speed}-{controller.max_speed} km/h")
 
-    # Start at 3.0 km/h
-    await controller.start(target_speed=3.0)
+    # Start the belt (runs at minimum speed)
+    await controller.start()
+
+    # Set desired speed
+    await controller.set_speed(3.0)
 
     # Read status
     print(f"Speed: {controller.status.speed} km/h")
@@ -91,13 +94,14 @@ The main entry point. Auto-detects protocol and delegates to the appropriate bac
 | `speed_increment` | Speed step size in km/h |
 | `connect()` | Connect and auto-detect protocol |
 | `disconnect()` | Disconnect from the device |
-| `start(target_speed=None)` | Start the belt, optionally at a target speed |
+| `start()` | Start the belt (runs at minimum speed) |
 | `stop()` | Stop the belt |
 | `set_speed(speed_kmh)` | Set speed (starts belt if stopped) |
 | `switch_mode(mode)` | Switch operating mode (WiLink: auto/manual/standby) |
 | `register_status_callback(cb)` | Register a `TreadmillStatus` callback |
 | `register_disconnect_callback(cb)` | Register a disconnect callback |
 | `update_ble_device(device)` | Update BLE device reference after rediscovery |
+| `update_state()` | Poll / refresh current status from the device |
 
 ### TreadmillStatus
 
@@ -137,10 +141,10 @@ For advanced use, you can use the protocol controllers directly:
 ## Known Behavior
 
 ### FTMS Cold Start
-KingSmith FTMS devices require a `START_OR_RESUME` command before the belt will accept speed commands. After a cold start, there is a delay of several seconds before `SET_TARGET_SPEED` takes effect. The library handles this automatically with retry logic.
+KingSmith FTMS devices require a `START_OR_RESUME` command before the belt will accept speed commands. The library handles this automatically: it sends START, waits for the belt to report speed > 0 via treadmill data notifications, then waits an additional stabilization period before sending `SET_TARGET_SPEED`. This avoids the BLE disconnects that occur when speed commands are sent too early during motor startup.
 
 ### BLE Connection Drops
-KingSmith FTMS devices may drop the BLE connection shortly after a cold start, especially at weaker signal strength. The library stores the pending target speed and can re-apply it after reconnection via the status callback mechanism.
+KingSmith FTMS devices may occasionally drop the BLE connection after a cold start due to firmware limitations. The library stores the pending target speed and automatically re-applies it after reconnection (with appropriate stabilization delay). When used with the Home Assistant integration's "Stay Connected" mode, this provides seamless recovery.
 
 ### Connection Exclusivity
 Only one BLE client can connect to the treadmill at a time. If Home Assistant holds the connection, the KS Fit app cannot connect, and vice versa.

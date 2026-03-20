@@ -11,7 +11,7 @@ Quick start:
     device = await BleakScanner.find_device_by_name("KS-HD-Z1D")
     controller = WalkingPadController(ble_device=device)
     await controller.connect()
-    await controller.start(target_speed=3.0)
+    await controller.start()
     print(controller.status)
     await controller.stop()
     await controller.disconnect()
@@ -32,7 +32,7 @@ from .ftms import FTMSController
 from .models import DeviceCapabilities, SpeedRange, TreadmillStatus
 from .wilink import WiLinkController
 
-__version__ = "0.1.0"
+__version__ = "0.4.0"
 
 __all__ = [
     # Main controller

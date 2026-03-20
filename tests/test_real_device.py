@@ -1,6 +1,8 @@
 """Test walkingpad-controller library against real KS-HD-Z1D device.
 
-Tests: scan -> connect -> read status -> start at 2.0 km/h -> observe -> stop -> disconnect
+Tests the cold-start flow WITHOUT automatic SET_TARGET_SPEED:
+  scan -> connect -> start (no speed) -> observe belt at min speed ->
+  set_speed (user action) -> observe -> stop -> disconnect
 """
 
 import asyncio
@@ -18,8 +20,8 @@ logging.basicConfig(
 _LOGGER = logging.getLogger("test")
 
 DEVICE_NAME = "KS-HD-Z1D"
-TARGET_SPEED = 2.0  # km/h
-RUN_DURATION = 25  # seconds
+TARGET_SPEED = 2.0  # km/h — sent AFTER belt is running (simulates user slider)
+RUN_DURATION = 20  # seconds to observe after setting speed
 
 
 async def main():
@@ -90,27 +92,48 @@ async def main():
         s.steps,
     )
 
-    # --- Step 5: Start at target speed ---
-    _LOGGER.info("Starting at %.1f km/h...", TARGET_SPEED)
-    result = await controller.start(target_speed=TARGET_SPEED)
+    # --- Step 5: Start (no target speed — belt runs at minimum) ---
+    _LOGGER.info("Starting belt (no target speed)...")
+    result = await controller.start()
     _LOGGER.info("start() returned: %s", result)
 
     if not controller.connected:
-        _LOGGER.warning(
-            "Connection lost during start! Waiting 10s for reconnect possibility..."
-        )
-        await asyncio.sleep(10)
-        if not controller.connected:
-            _LOGGER.error("Still disconnected. Test cannot continue.")
-            return
+        _LOGGER.error("Connection lost during start! TEST FAILED.")
+        return
 
-    # --- Step 6: Run and observe ---
-    _LOGGER.info("Belt should be running. Observing for %ds...", RUN_DURATION)
+    s = controller.status
+    _LOGGER.info(
+        "After start: speed=%.2f km/h (should be ~%.1f min speed)",
+        s.speed,
+        controller.min_speed,
+    )
+
+    # --- Step 6: Wait a moment, then set speed (simulates user slider) ---
+    _LOGGER.info(
+        "Belt running at min speed. Waiting 5s before setting speed to %.1f...",
+        TARGET_SPEED,
+    )
+    await asyncio.sleep(5)
+
+    if not controller.connected:
+        _LOGGER.error("Connection lost while waiting! TEST FAILED.")
+        return
+
+    _LOGGER.info("Setting speed to %.1f km/h (simulates user slider)...", TARGET_SPEED)
+    result = await controller.set_speed(TARGET_SPEED)
+    _LOGGER.info("set_speed() returned: %s", result)
+
+    if not controller.connected:
+        _LOGGER.error("Connection lost after set_speed! TEST FAILED.")
+        return
+
+    # --- Step 7: Run and observe ---
+    _LOGGER.info("Observing for %ds...", RUN_DURATION)
     start_time = time.time()
     while time.time() - start_time < RUN_DURATION:
         if disconnected.is_set():
-            _LOGGER.warning("Disconnected during run!")
-            break
+            _LOGGER.error("Disconnected during run! TEST FAILED.")
+            return
         await asyncio.sleep(1)
 
     s = controller.status
@@ -123,7 +146,7 @@ async def main():
         s.steps,
     )
 
-    # --- Step 7: Stop ---
+    # --- Step 8: Stop ---
     if controller.connected:
         _LOGGER.info("Stopping belt...")
         result = await controller.stop()
@@ -132,11 +155,11 @@ async def main():
         s = controller.status
         _LOGGER.info("After stop: speed=%.2f, belt=%s", s.speed, s.belt_state)
 
-    # --- Step 8: Disconnect ---
+    # --- Step 9: Disconnect ---
     _LOGGER.info("Disconnecting...")
     await controller.disconnect()
     _LOGGER.info("Disconnected. Total status updates received: %d", status_count)
-    _LOGGER.info("TEST PASSED!")
+    _LOGGER.info("TEST PASSED — no BLE disconnect during cold start!")
 
 
 if __name__ == "__main__":

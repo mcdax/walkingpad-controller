@@ -476,22 +476,18 @@ class FTMSController:
             _LOGGER.warning("FTMS: Failed to acquire control")
         return result
 
-    async def start(self, target_speed: float | None = None) -> bool:
-        """Start or resume the treadmill.
+    async def start(self) -> bool:
+        """Start or resume the treadmill belt.
 
-        On KingSmith devices, a cold START_OR_RESUME is required for a stopped
-        belt. SET_TARGET_SPEED alone gets ACKed but ignored. After cold start,
-        the device needs time before it honors speed commands, so this method
-        retries with increasing delays.
-
-        Args:
-            target_speed: Target speed in km/h. If None, uses min speed.
+        Sends START_OR_RESUME and, on a cold start, waits for the belt to
+        report speed > 0.  Does NOT send SET_TARGET_SPEED — the user sets
+        the speed explicitly via set_target_speed() (e.g. the HA speed
+        slider).  Sending a speed command during motor spin-up crashes the
+        BLE connection on KingSmith firmware.
 
         Returns:
             True if the belt is running. False if the connection was lost.
         """
-        speed = target_speed if target_speed is not None else self.min_speed
-
         if not self._has_control:
             await self._request_control()
 
@@ -499,82 +495,53 @@ class FTMSController:
         if cold_start:
             _LOGGER.info("FTMS: START_OR_RESUME succeeded (cold start)")
         else:
-            _LOGGER.debug("FTMS: START_OR_RESUME failed (expected if already started)")
+            _LOGGER.debug("FTMS: START_OR_RESUME not needed (belt already running)")
 
         if not self.connected:
             _LOGGER.warning("FTMS: Connection lost after START_OR_RESUME")
             return False
 
-        # After a cold start, retry SET_TARGET_SPEED with increasing delays.
-        # KS-Z1D testing showed 2s is insufficient — device ACKs but ignores.
-        max_attempts = 4 if cold_start else 1
-        for attempt in range(max_attempts):
-            if cold_start:
-                delay = 2.0 + attempt * 2.0
-                _LOGGER.debug(
-                    "FTMS: Waiting %.1fs before SET_TARGET_SPEED attempt %d/%d",
-                    delay,
-                    attempt + 1,
-                    max_attempts,
-                )
-                await asyncio.sleep(delay)
-
-            if not self.connected:
-                _LOGGER.warning(
-                    "FTMS: Connection lost before SET_TARGET_SPEED attempt %d",
-                    attempt + 1,
-                )
+        if cold_start:
+            belt_running = await self._wait_for_belt_moving(timeout=15.0)
+            if not belt_running:
+                if not self.connected:
+                    _LOGGER.warning("FTMS: Connection lost waiting for belt to start")
+                    return False
+                _LOGGER.warning("FTMS: Belt did not start moving within timeout")
                 return False
-
-            result = await self.set_target_speed(speed)
-            if not result:
-                _LOGGER.warning(
-                    "FTMS: SET_TARGET_SPEED(%.1f) failed on attempt %d/%d",
-                    speed,
-                    attempt + 1,
-                    max_attempts,
-                )
-                return False
-
-            # For non-cold-start or min speed, no need to verify
-            if not cold_start or speed <= self.min_speed + 0.05:
-                return True
-
-            # Verify the speed actually changed
-            verified = await self._verify_speed(speed, timeout=3.0)
-            if verified:
-                _LOGGER.info(
-                    "FTMS: Speed verified at %.1f km/h (attempt %d/%d)",
-                    speed,
-                    attempt + 1,
-                    max_attempts,
-                )
-                return True
-
             _LOGGER.info(
-                "FTMS: Speed still %.2f after attempt %d/%d (target %.1f)",
+                "FTMS: Cold start complete — belt running at %.1f km/h",
                 self._status.speed,
-                attempt + 1,
-                max_attempts,
-                speed,
             )
 
-        _LOGGER.warning(
-            "FTMS: Could not reach %.1f km/h after %d attempts (current: %.2f)",
-            speed,
-            max_attempts,
-            self._status.speed,
-        )
-        return True  # Belt IS running, just not at desired speed
+        return True
 
-    async def _verify_speed(self, target: float, timeout: float = 3.0) -> bool:
-        """Wait for the reported speed to match the target."""
-        tolerance = max(self._capabilities.speed_range.increment, 0.15)
+    async def _wait_for_belt_moving(self, timeout: float = 15.0) -> bool:
+        """Wait for the belt to report speed > 0 after a cold start.
+
+        Polls treadmill-data notifications until the belt is physically
+        moving.  No stabilisation delay is applied here — we deliberately
+        avoid sending any speed command while the connection is fragile.
+
+        Args:
+            timeout: Maximum time to wait for speed > 0 (seconds).
+
+        Returns True if the belt is moving, False on timeout/disconnect.
+        """
+        _LOGGER.debug(
+            "FTMS: Waiting for belt to start moving (timeout=%.0fs)...", timeout
+        )
         deadline = time.time() + timeout
         while time.time() < deadline:
             if not self.connected:
                 return False
-            if abs(self._status.speed - target) <= tolerance:
+            if self._status.speed > 0:
+                wait_elapsed = timeout - (deadline - time.time())
+                _LOGGER.info(
+                    "FTMS: Belt moving at %.1f km/h (waited %.1fs)",
+                    self._status.speed,
+                    wait_elapsed,
+                )
                 return True
             await asyncio.sleep(0.5)
         return False
