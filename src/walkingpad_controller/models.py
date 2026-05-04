@@ -73,3 +73,6 @@ class DeviceCapabilities:
 
     has_supplement: bool = False
     """Whether the KingSmith supplement service is available."""
+
+    has_vendor_preamble: bool = False
+    """Whether the KingSmith MC-21 vendor pre-amble characteristic is present."""
