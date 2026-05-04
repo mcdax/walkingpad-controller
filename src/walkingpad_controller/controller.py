@@ -102,7 +102,16 @@ class WalkingPadController:
 
     @property
     def connected(self) -> bool:
-        """Whether the device is currently connected."""
+        """Whether the device is currently connected.
+
+        Defers to the active backend so the result reflects the live BLE
+        state, not just a cached bool that can drift if the firmware
+        unilaterally drops the link before the disconnect callback fires.
+        """
+        if self._ftms is not None:
+            return self._ftms.connected
+        if self._wilink is not None:
+            return self._wilink.connected
         return self._connected
 
     @property

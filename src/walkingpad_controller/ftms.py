@@ -128,6 +128,12 @@ class FTMSController:
 
         Args:
             ble_device: The BLE device to connect to.
+
+        Raises:
+            BleakError: If the underlying BLE link drops before setup
+                finishes (e.g. shortly after a previous disconnect, the
+                firmware sometimes accepts the connection and then closes
+                it again before service discovery completes).
         """
         _LOGGER.info("FTMS: Connecting to %s", ble_device.address)
 
@@ -150,6 +156,18 @@ class FTMSController:
 
         # Request control
         await self._request_control()
+
+        # Sanity check: if the link dropped at any point during setup
+        # (Bleak's is_connected goes False, our _connected bit is flipped
+        # by the disconnect callback), surface that as a failed connect
+        # rather than silently claiming success — otherwise callers see
+        # `connected == False` immediately after `connect()` "succeeds"
+        # and have no clean signal that they should retry.
+        if not self.connected:
+            raise BleakError(
+                "FTMS: BLE link dropped during connection setup; treating "
+                "as a failed connect."
+            )
 
     async def disconnect(self) -> None:
         """Disconnect from the device."""
@@ -543,17 +561,18 @@ class FTMSController:
         if not self._has_control:
             await self._request_control()
 
-        cold_start = await self._write_control_point(FTMSOpcode.START_OR_RESUME)
-        if cold_start:
-            _LOGGER.info("FTMS: START_OR_RESUME succeeded (cold start)")
-        else:
-            _LOGGER.debug("FTMS: START_OR_RESUME not needed (belt already running)")
-
         if not self.connected:
-            _LOGGER.warning("FTMS: Connection lost after START_OR_RESUME")
+            _LOGGER.warning("FTMS: Not connected; cannot start")
             return False
 
-        if cold_start:
+        accepted = await self._write_control_point(FTMSOpcode.START_OR_RESUME)
+
+        if not self.connected:
+            _LOGGER.warning("FTMS: Connection lost during START_OR_RESUME")
+            return False
+
+        if accepted:
+            _LOGGER.info("FTMS: START_OR_RESUME accepted (cold start)")
             belt_running = await self._wait_for_belt_moving(timeout=15.0)
             if not belt_running:
                 if not self.connected:
@@ -565,8 +584,26 @@ class FTMSController:
                 "FTMS: Cold start complete — belt running at %.1f km/h",
                 self._status.speed,
             )
+            return True
 
-        return True
+        # The device rejected START_OR_RESUME (non-success indication).
+        # That can mean either (a) belt is already running, or (b) the
+        # device is in a state that doesn't accept start right now —
+        # e.g. just transitioned through stop and isn't fully settled.
+        # Disambiguate by looking at the live speed.
+        if self._status.speed > 0:
+            _LOGGER.info(
+                "FTMS: START_OR_RESUME rejected but belt is running at "
+                "%.1f km/h — treating as success",
+                self._status.speed,
+            )
+            return True
+
+        _LOGGER.warning(
+            "FTMS: START_OR_RESUME rejected and belt is not moving "
+            "(device may need a moment after stop)"
+        )
+        return False
 
     async def _wait_for_belt_moving(self, timeout: float = 15.0) -> bool:
         """Wait for the belt to report speed > 0 after a cold start.

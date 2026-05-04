@@ -132,6 +132,11 @@ class TreadmillDataFlags:
 # These devices have service 0x1826 but NOT 0xFE00.
 FTMS_NAME_PREFIXES = ("KS-HD-",)
 
-# Default connection parameters
-MAX_CONNECT_RETRIES = 3
-RETRY_DELAY_SECONDS = 2.0
+# Default connection parameters.
+# KingSmith FTMS firmware can be left in a bad state for several seconds
+# after a previous abrupt disconnect — Bleak/BlueZ then accepts the next
+# connect() call but the device closes the link before service discovery
+# completes. A handful of retries with a few seconds between them rides
+# this out reliably.
+MAX_CONNECT_RETRIES = 5
+RETRY_DELAY_SECONDS = 3.0
