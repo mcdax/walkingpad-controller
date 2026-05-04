@@ -38,9 +38,12 @@ from .const import (
     FTMS_FEATURE_UUID,
     KINGSMITH_VENDOR_PREAMBLE_PAYLOAD,
     KINGSMITH_VENDOR_PREAMBLE_UUID,
+    SOFTWARE_REVISION_UUID,
     SUPPLEMENT_SERVICE_UUID,
     SUPPORTED_SPEED_RANGE_UUID,
+    TRAINING_STATUS_UUID,
     TREADMILL_DATA_UUID,
+    FitnessMachineStatusOpcode,
     FTMSOpcode,
     FTMSResultCode,
     FTMSStopPauseParam,
@@ -49,6 +52,17 @@ from .const import (
 from .models import DeviceCapabilities, SpeedRange, TreadmillStatus
 
 _LOGGER = logging.getLogger(__name__)
+
+
+# Mapping from FTMS Control Point opcode to the Fitness Machine Status (2ADA)
+# event that confirms the command was applied. Used on the pre-amble path,
+# where the firmware acks most commands via 2ADA rather than a CP indication.
+_CP_TO_STATUS_ACK: dict[int, int] = {
+    FTMSOpcode.START_OR_RESUME: FitnessMachineStatusOpcode.STARTED_OR_RESUMED,
+    FTMSOpcode.STOP_OR_PAUSE: FitnessMachineStatusOpcode.STOPPED_OR_PAUSED,
+    FTMSOpcode.SET_TARGET_SPEED: FitnessMachineStatusOpcode.TARGET_SPEED_CHANGED,
+    FTMSOpcode.SET_TARGET_INCLINATION: FitnessMachineStatusOpcode.TARGET_INCLINATION_CHANGED,
+}
 
 
 class FTMSController:
@@ -70,6 +84,12 @@ class FTMSController:
         # Control point indication response
         self._cp_response_event = asyncio.Event()
         self._cp_response_data: bytes = b""
+
+        # Fitness Machine Status (2ADA) ack — used on the vendor pre-amble
+        # path, where most Control Point opcodes are acknowledged via a
+        # status event rather than a CP indication.
+        self._status_ack_event = asyncio.Event()
+        self._status_ack_expected_opcode: int | None = None
 
     @property
     def connected(self) -> bool:
@@ -102,6 +122,11 @@ class FTMSController:
     def speed_increment(self) -> float:
         """Speed increment in km/h."""
         return self._capabilities.speed_range.increment
+
+    @property
+    def firmware_version(self) -> str:
+        """Firmware version string read from the device, or empty if unavailable."""
+        return self._capabilities.firmware_version
 
     def register_status_callback(
         self, callback: Callable[[TreadmillStatus], None]
@@ -274,37 +299,47 @@ class FTMSController:
         except Exception as err:
             _LOGGER.warning("FTMS: Failed to read features: %s", err)
 
+        # Read Software Revision String (2A28). Best-effort: some devices
+        # don't expose it. KS Fit reads this for the firmware-version display.
+        try:
+            sw_data = await self._client.read_gatt_char(SOFTWARE_REVISION_UUID)
+            if sw_data:
+                self._capabilities.firmware_version = sw_data.decode(
+                    "utf-8", errors="replace"
+                ).strip("\x00 \t\r\n")
+                _LOGGER.info(
+                    "FTMS: Firmware version: %s",
+                    self._capabilities.firmware_version,
+                )
+        except Exception as err:
+            _LOGGER.debug("FTMS: Failed to read firmware version: %s", err)
+
     async def _subscribe_notifications(self) -> None:
-        """Subscribe to FTMS data notifications."""
+        """Subscribe to FTMS data notifications.
+
+        KingSmith firmware silently drops CCCD writes that arrive in close
+        succession. KS Fit staggers its subscriptions with progressive delays
+        of 100/200/300 ms — we mirror that. See `docs/ftms-protocol-reference.md`
+        §2.1 for the analysis behind these numbers.
+        """
         if not self._client:
             return
 
-        # Subscribe to Treadmill Data (2ACD)
-        try:
-            await self._client.start_notify(
-                TREADMILL_DATA_UUID, self._on_treadmill_data
-            )
-            _LOGGER.debug("FTMS: Subscribed to Treadmill Data")
-        except Exception as err:
-            _LOGGER.warning("FTMS: Failed to subscribe to Treadmill Data: %s", err)
+        subscriptions = (
+            (TREADMILL_DATA_UUID, self._on_treadmill_data, "Treadmill Data", 0.10),
+            (FITNESS_MACHINE_STATUS_UUID, self._on_machine_status, "Fitness Machine Status", 0.20),
+            (TRAINING_STATUS_UUID, self._on_training_status, "Training Status", 0.30),
+            (FTMS_CONTROL_POINT_UUID, self._on_control_point_response, "Control Point", 0.0),
+        )
 
-        # Subscribe to Fitness Machine Status (2ADA)
-        try:
-            await self._client.start_notify(
-                FITNESS_MACHINE_STATUS_UUID, self._on_machine_status
-            )
-            _LOGGER.debug("FTMS: Subscribed to Fitness Machine Status")
-        except Exception as err:
-            _LOGGER.warning("FTMS: Failed to subscribe to Machine Status: %s", err)
-
-        # Subscribe to Control Point indications (2AD9)
-        try:
-            await self._client.start_notify(
-                FTMS_CONTROL_POINT_UUID, self._on_control_point_response
-            )
-            _LOGGER.debug("FTMS: Subscribed to Control Point indications")
-        except Exception as err:
-            _LOGGER.warning("FTMS: Failed to subscribe to Control Point: %s", err)
+        for uuid, handler, label, delay_after in subscriptions:
+            try:
+                await self._client.start_notify(uuid, handler)
+                _LOGGER.debug("FTMS: Subscribed to %s", label)
+            except Exception as err:
+                _LOGGER.warning("FTMS: Failed to subscribe to %s: %s", label, err)
+            if delay_after:
+                await asyncio.sleep(delay_after)
 
     # --- Notification Handlers ---
 
@@ -416,7 +451,13 @@ class FTMSController:
         self._notify_status()
 
     def _on_machine_status(self, sender: int, data: bytearray) -> None:
-        """Handle Fitness Machine Status (2ADA) notifications."""
+        """Handle Fitness Machine Status (2ADA) notifications.
+
+        On KingSmith firmware that uses the vendor pre-amble (e.g. MC-21),
+        these events are how command success is signalled — the device
+        sends *no* indication on the Control Point itself for opcodes other
+        than REQUEST_CONTROL.
+        """
         if len(data) < 1:
             return
 
@@ -425,16 +466,54 @@ class FTMSController:
             "FTMS: Machine status event: 0x%02x (data: %s)", opcode, data.hex()
         )
 
-        if opcode == 0x02:  # Stopped or paused
+        # Wake any pending command waiter that's expecting this opcode.
+        if (
+            self._status_ack_expected_opcode is not None
+            and opcode == self._status_ack_expected_opcode
+        ):
+            self._status_ack_event.set()
+
+        if opcode == FitnessMachineStatusOpcode.STOPPED_OR_PAUSED:
             if len(data) >= 2:
-                if data[1] == 0x01:
+                if data[1] == FTMSStopPauseParam.STOP:
                     _LOGGER.info("FTMS: Treadmill stopped by user")
-                elif data[1] == 0x02:
+                elif data[1] == FTMSStopPauseParam.PAUSE:
                     _LOGGER.info("FTMS: Treadmill paused by user")
-        elif opcode == 0x03:
+        elif opcode == FitnessMachineStatusOpcode.STOPPED_BY_SAFETY_KEY:
             _LOGGER.info("FTMS: Treadmill stopped by safety key")
-        elif opcode == 0x04:
+        elif opcode == FitnessMachineStatusOpcode.STARTED_OR_RESUMED:
             _LOGGER.info("FTMS: Treadmill started/resumed by user")
+        elif opcode == FitnessMachineStatusOpcode.TARGET_SPEED_CHANGED:
+            if len(data) >= 3:
+                speed_raw = struct.unpack_from("<H", data, 1)[0]
+                _LOGGER.info(
+                    "FTMS: Target speed changed to %.2f km/h", speed_raw / 100.0
+                )
+        elif opcode == FitnessMachineStatusOpcode.TARGET_INCLINATION_CHANGED:
+            if len(data) >= 3:
+                incl_raw = struct.unpack_from("<h", data, 1)[0]
+                _LOGGER.info(
+                    "FTMS: Target inclination changed to %.1f%%", incl_raw / 10.0
+                )
+
+    def _on_training_status(self, sender: int, data: bytearray) -> None:
+        """Handle Training Status (2AD3) notifications.
+
+        Standard FTMS Training Status frame:
+          byte 0: flags (bit 0 = string present, bit 1 = extended info)
+          byte 1: training status code (0=other, 1=idle, 2=warming up, …)
+          bytes 2+: optional UTF-8 label / extended data (when bit 0 set)
+        """
+        if len(data) < 2:
+            return
+        flags = data[0]
+        status_code = data[1]
+        _LOGGER.debug(
+            "FTMS: Training status flags=0x%02x code=0x%02x raw=%s",
+            flags,
+            status_code,
+            data.hex(),
+        )
 
     def _on_control_point_response(self, sender: int, data: bytearray) -> None:
         """Handle FTMS Control Point (2AD9) indication responses.
@@ -468,6 +547,18 @@ class FTMSController:
             except BleakError as err:
                 _LOGGER.debug("FTMS: Vendor pre-amble write error: %s", err)
 
+        # On the pre-amble path, the device acknowledges most opcodes via a
+        # Fitness Machine Status (2ADA) event rather than a Control Point
+        # indication. Set up an expectation now so the status handler can
+        # signal us when the matching event arrives.
+        expected_status_opcode = _CP_TO_STATUS_ACK.get(opcode)
+        if (
+            self._capabilities.has_vendor_preamble
+            and expected_status_opcode is not None
+        ):
+            self._status_ack_expected_opcode = expected_status_opcode
+            self._status_ack_event.clear()
+
         command = bytes([opcode]) + params
         _LOGGER.debug("FTMS: Sending control point command: %s", command.hex())
 
@@ -478,23 +569,49 @@ class FTMSController:
                 FTMS_CONTROL_POINT_UUID, command, response=True
             )
         except BleakError as err:
+            self._status_ack_expected_opcode = None
             _LOGGER.warning("FTMS: Write error: %s", err)
             return False
 
-        # Wait for indication response. On firmware that uses the vendor
-        # pre-amble (MC-21), the device silently accepts most commands
-        # without sending an indication — the snoop shows only the very
-        # first REQUEST_CONTROL gets one. Treat timeout as success in that
-        # case, with a shorter wait so we don't stall the caller.
+        # Wait for either a Control Point indication OR a matching Fitness
+        # Machine Status event. On standard FTMS firmware the indication
+        # arrives quickly (sub-second). On the pre-amble path most opcodes
+        # only get a 2ADA event; first-call REQUEST_CONTROL still gets an
+        # indication. Race them so whichever arrives first wins.
         effective_timeout = (
-            1.0 if self._capabilities.has_vendor_preamble else timeout
+            3.0 if self._capabilities.has_vendor_preamble else timeout
         )
+        waiters = [asyncio.create_task(self._cp_response_event.wait())]
+        if self._capabilities.has_vendor_preamble and expected_status_opcode is not None:
+            waiters.append(asyncio.create_task(self._status_ack_event.wait()))
+
         try:
-            await asyncio.wait_for(self._cp_response_event.wait(), effective_timeout)
-        except asyncio.TimeoutError:
+            done, pending = await asyncio.wait(
+                waiters,
+                timeout=effective_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for w in waiters:
+                if not w.done():
+                    w.cancel()
+
+        # Always clear the expectation, regardless of outcome.
+        self._status_ack_expected_opcode = None
+
+        # Status event won the race → command was acknowledged by the device.
+        if self._status_ack_event.is_set():
+            _LOGGER.debug(
+                "FTMS: Status-event ack for opcode 0x%02x", opcode
+            )
+            return True
+
+        # Indication won the race → fall through to the standard parser below.
+        if not self._cp_response_event.is_set():
+            # Neither arrived in time.
             if self._capabilities.has_vendor_preamble:
                 _LOGGER.debug(
-                    "FTMS: No indication for opcode 0x%02x — assuming success "
+                    "FTMS: No ack for opcode 0x%02x — assuming success "
                     "(vendor pre-amble path)",
                     opcode,
                 )

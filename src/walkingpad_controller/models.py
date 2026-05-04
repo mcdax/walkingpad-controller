@@ -76,3 +76,6 @@ class DeviceCapabilities:
 
     has_vendor_preamble: bool = False
     """Whether the KingSmith MC-21 vendor pre-amble characteristic is present."""
+
+    firmware_version: str = ""
+    """Firmware version reported by the Software Revision String (0x2A28)."""

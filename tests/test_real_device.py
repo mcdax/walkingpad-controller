@@ -70,6 +70,10 @@ async def main():
     # --- Step 3: Connect ---
     _LOGGER.info("Connecting...")
     await controller.connect()
+    # BleakClient may retry inside connect(), each retry firing the disconnect
+    # callback. Clear the latch once we're actually connected so the observe
+    # loop below doesn't bail on a stale flag.
+    disconnected.clear()
     _LOGGER.info("Connected! Protocol: %s", controller.protocol.value)
     _LOGGER.info(
         "Speed range: %.1f - %.1f km/h (step %.2f)",

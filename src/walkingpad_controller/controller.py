@@ -150,6 +150,17 @@ class WalkingPadController:
             return self._wilink.speed_increment
         return 0.1
 
+    @property
+    def firmware_version(self) -> str:
+        """Firmware version string, or empty if unavailable.
+
+        Read from Software Revision String (`0x2A28`) on FTMS devices.
+        Returns an empty string for WiLink devices (not implemented).
+        """
+        if self._ftms:
+            return self._ftms.firmware_version
+        return ""
+
     # --- Callbacks ---
 
     def register_status_callback(

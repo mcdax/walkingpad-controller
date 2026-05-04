@@ -10,6 +10,7 @@ FTMS_SERVICE_UUID = "00001826-0000-1000-8000-00805f9b34fb"
 
 # FTMS Characteristics
 FTMS_FEATURE_UUID = "00002acc-0000-1000-8000-00805f9b34fb"
+SOFTWARE_REVISION_UUID = "00002a28-0000-1000-8000-00805f9b34fb"
 TREADMILL_DATA_UUID = "00002acd-0000-1000-8000-00805f9b34fb"
 TRAINING_STATUS_UUID = "00002ad3-0000-1000-8000-00805f9b34fb"
 SUPPORTED_SPEED_RANGE_UUID = "00002ad4-0000-1000-8000-00805f9b34fb"
@@ -100,6 +101,88 @@ class FTMSStopPauseParam(IntEnum):
     PAUSE = 0x02
 
 
+@unique
+class FitnessMachineStatusOpcode(IntEnum):
+    """Fitness Machine Status (0x2ADA) event opcodes.
+
+    These notifications are how the device reports state changes — both in
+    response to client commands and to physical interactions like the remote
+    control or safety key.
+    """
+
+    RESET = 0x01
+    STOPPED_OR_PAUSED = 0x02              # param: 0x01=stop, 0x02=pause
+    STOPPED_BY_SAFETY_KEY = 0x03
+    STARTED_OR_RESUMED = 0x04
+    TARGET_SPEED_CHANGED = 0x05           # param: UINT16 LE in 0.01 km/h
+    TARGET_INCLINATION_CHANGED = 0x06     # param: INT16 LE in 0.1%
+    TARGET_RESISTANCE_CHANGED = 0x07
+    TARGET_POWER_CHANGED = 0x08
+    TARGET_HEART_RATE_CHANGED = 0x09
+    TARGET_EXPENDED_ENERGY_CHANGED = 0x0A
+    TARGET_TIME_CHANGED = 0x0B
+    SPIN_DOWN_STATUS = 0x14
+    TARGET_CADENCE_CHANGED = 0x15
+    CONTROL_PERMISSION_LOST = 0xFF
+
+
+@unique
+class KingSmithMode(IntEnum):
+    """KingSmith operating mode enum (from KS Fit's `Mode` enum).
+
+    Value semantics decoded from the v5.9.10 KS Fit AOT snapshot. Not all
+    devices support every mode — e.g. `programCourse` / `programCustom`
+    require the supplement service (KS-HD-*).
+    """
+
+    AUTO = 0x0
+    MANUAL = 0x1
+    STANDBY = 0x2
+    NEWER = 0x3
+    CORRECT = 0x4
+    CHILD_LOCK = 0x5
+    NORMAL = 0x6
+    WALK = 0x7
+    HIIT = 0x8
+    BURN = 0x9
+    OTHER = 0xA
+    MASSAGE = 0xB
+    PROGRAM_COURSE = 0xC
+    PROGRAM_CUSTOM = 0xD
+
+
+@unique
+class KingSmithStatus(IntEnum):
+    """KingSmith device status enum (from KS Fit's `Status` enum)."""
+
+    READY = 0x0
+    RUN = 0x1
+    PAUSE = 0x2
+    STOP = 0x3
+    FAULT = 0x4
+    SLEEP = 0x5
+    COUNTDOWN_0 = 0x6
+    COUNTDOWN_1 = 0x7
+    COUNTDOWN_2 = 0x8
+    COUNTDOWN_3 = 0x9
+    OTHER = 0xA
+    LOCK_OFF = 0xB
+    PRE_START = 0xC
+    PRE_END = 0xD
+
+
+@unique
+class KingSmithTreadmillStatus(IntEnum):
+    """Treadmill-specific status (from KS Fit's `TreadmillStatus` enum)."""
+
+    UNKNOWN = 0x0
+    IDLE = 0x1
+    RUNNING = 0x2
+    PRE_START = 0x3
+    PRE_END = 0x4
+    SAFETY_OFF = 0x5
+
+
 class TreadmillDataFlags:
     """Bit flags for the FTMS Treadmill Data characteristic (0x2ACD).
 
@@ -130,7 +213,15 @@ class TreadmillDataFlags:
 
 # BLE name prefixes known to use FTMS protocol.
 # These devices have service 0x1826 but NOT 0xFE00.
-FTMS_NAME_PREFIXES = ("KS-HD-",)
+#
+# - KS-HD-*       : modern KingSmith treadmills (e.g. KS-HD-Z1D), expose the
+#                   FTMS supplement service (24e2521c-...) for vendor commands.
+# - KS-MC21-*     : MC-21 series (e.g. KS-MC21-D06BFD), expose the ODM vendor
+#                   characteristic (d18d2c10-...) for the per-command pre-amble.
+# - KS-SMC21C-*   : "C" variant of the MC-21 family.
+# - ZP-ZEALR1-*   : Zeal-branded OEM variant of the MC-21 (KS Fit's isMC21
+#                   getter matches all three).
+FTMS_NAME_PREFIXES = ("KS-HD-", "KS-MC21-", "KS-SMC21C-", "ZP-ZEALR1-")
 
 # Default connection parameters.
 # KingSmith FTMS firmware can be left in a bad state for several seconds

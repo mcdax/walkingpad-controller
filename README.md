@@ -7,11 +7,12 @@ Supports both **FTMS** (Fitness Machine Service) and legacy **WiLink** protocols
 ## Features
 
 - **Unified API** — single `WalkingPadController` class for all device types
-- **Auto protocol detection** — FTMS for newer KS-HD-* devices, WiLink for older models
+- **Auto protocol detection** — FTMS for newer KS-HD-* / KS-MC21-* / KS-SMC21C-* / ZP-ZEALR1-* devices, WiLink for older models
 - **Real-time status** — speed, distance, duration, calories, steps via BLE notifications
 - **Cold-start handling** — waits for belt to start moving and stabilize before sending speed commands, avoiding BLE disconnects on KingSmith devices
 - **Reconnect recovery** — pending target speed is automatically re-applied after BLE reconnection
-- **KingSmith extensions** — step counter via proprietary FTMS extension (bit 13)
+- **KingSmith extensions** — step counter via proprietary FTMS extension (bit 13), MC-21 vendor pre-amble for `SET_TARGET_SPEED`, supplement service detection (KS-HD-*)
+- **Firmware version** — exposed via `controller.firmware_version` (FTMS only)
 
 ## Installation
 
@@ -92,6 +93,7 @@ The main entry point. Auto-detects protocol and delegates to the appropriate bac
 | `status` | Current `TreadmillStatus` |
 | `min_speed` / `max_speed` | Speed range in km/h (read from device for FTMS) |
 | `speed_increment` | Speed step size in km/h |
+| `firmware_version` | Firmware version string (FTMS only; empty otherwise) |
 | `connect()` | Connect and auto-detect protocol |
 | `disconnect()` | Disconnect from the device |
 | `start()` | Start the belt (runs at minimum speed) |
@@ -130,8 +132,9 @@ For advanced use, you can use the protocol controllers directly:
 ## Supported Devices
 
 ### FTMS Protocol (tested)
-- KingSmith KS-Z1D (BLE name: `KS-HD-Z1D`)
-- Other KingSmith devices with BLE names starting with `KS-HD-`
+- KingSmith KS-Z1D (BLE name: `KS-HD-Z1D`) — confirmed working
+- KingSmith MC-21 (BLE names: `KS-MC21-*`, `KS-SMC21C-*`, `ZP-ZEALR1-*`) — confirmed working as of v0.4.1, requires the vendor pre-amble described below
+- Other KingSmith devices with BLE names starting with `KS-HD-` are expected to work via the same FTMS / supplement-service code path
 
 ### WiLink Protocol (via ph4-walkingpad)
 - WalkingPad A1, A1 Pro
@@ -148,6 +151,11 @@ KingSmith FTMS devices may occasionally drop the BLE connection after a cold sta
 
 ### Connection Exclusivity
 Only one BLE client can connect to the treadmill at a time. If Home Assistant holds the connection, the KS Fit app cannot connect, and vice versa.
+
+### MC-21 Vendor Pre-amble
+The KingSmith MC-21 family (`KS-MC21-*`, `KS-SMC21C-*`, `ZP-ZEALR1-*`) refuses standard FTMS `REQUEST_CONTROL` and rejects `SET_TARGET_SPEED` unless a fixed 8-byte payload is first written to a vendor characteristic (`d18d2c10-…`) embedded in the FTMS service. This library detects the characteristic on connect and replays the pre-amble before each Control Point command — matching what the official KS Fit app does. On these devices, command success is signalled via Fitness Machine Status (`0x2ADA`) events rather than Control Point indications; the library races both signals and accepts whichever arrives first.
+
+For the full reverse-engineering analysis, see [docs/ftms-protocol-reference.md](docs/ftms-protocol-reference.md) and [docs/ks-fit-reverse-engineering.md](docs/ks-fit-reverse-engineering.md).
 
 ## Requirements
 
