@@ -36,6 +36,8 @@ from .const import (
     FITNESS_MACHINE_STATUS_UUID,
     FTMS_CONTROL_POINT_UUID,
     FTMS_FEATURE_UUID,
+    KINGSMITH_VENDOR_PREAMBLE_PAYLOAD,
+    KINGSMITH_VENDOR_PREAMBLE_UUID,
     SUPPLEMENT_SERVICE_UUID,
     SUPPORTED_SPEED_RANGE_UUID,
     TREADMILL_DATA_UUID,
@@ -195,6 +197,20 @@ class FTMSController:
                 _LOGGER.info("FTMS: Supplement service detected")
         except Exception:
             self._capabilities.has_supplement = False
+
+        # Check for the KingSmith MC-21 vendor pre-amble characteristic.
+        # If present, we'll write the magic payload before every Control
+        # Point command — that's what KS Fit does, and without it the
+        # firmware refuses SET_TARGET_SPEED.
+        try:
+            char = self._client.services.get_characteristic(
+                KINGSMITH_VENDOR_PREAMBLE_UUID
+            )
+            if char is not None:
+                self._capabilities.has_vendor_preamble = True
+                _LOGGER.info("FTMS: KingSmith vendor pre-amble characteristic detected")
+        except Exception:
+            self._capabilities.has_vendor_preamble = False
 
     async def _read_capabilities(self) -> None:
         """Read device capabilities from FTMS characteristics."""
@@ -424,6 +440,16 @@ class FTMSController:
             _LOGGER.warning("FTMS: Not connected, cannot send command")
             return False
 
+        if self._capabilities.has_vendor_preamble:
+            try:
+                await self._client.write_gatt_char(
+                    KINGSMITH_VENDOR_PREAMBLE_UUID,
+                    KINGSMITH_VENDOR_PREAMBLE_PAYLOAD,
+                    response=True,
+                )
+            except BleakError as err:
+                _LOGGER.debug("FTMS: Vendor pre-amble write error: %s", err)
+
         command = bytes([opcode]) + params
         _LOGGER.debug("FTMS: Sending control point command: %s", command.hex())
 
@@ -437,10 +463,24 @@ class FTMSController:
             _LOGGER.warning("FTMS: Write error: %s", err)
             return False
 
-        # Wait for indication response
+        # Wait for indication response. On firmware that uses the vendor
+        # pre-amble (MC-21), the device silently accepts most commands
+        # without sending an indication — the snoop shows only the very
+        # first REQUEST_CONTROL gets one. Treat timeout as success in that
+        # case, with a shorter wait so we don't stall the caller.
+        effective_timeout = (
+            1.0 if self._capabilities.has_vendor_preamble else timeout
+        )
         try:
-            await asyncio.wait_for(self._cp_response_event.wait(), timeout)
+            await asyncio.wait_for(self._cp_response_event.wait(), effective_timeout)
         except asyncio.TimeoutError:
+            if self._capabilities.has_vendor_preamble:
+                _LOGGER.debug(
+                    "FTMS: No indication for opcode 0x%02x — assuming success "
+                    "(vendor pre-amble path)",
+                    opcode,
+                )
+                return True
             _LOGGER.warning(
                 "FTMS: Control point response timeout for opcode 0x%02x", opcode
             )
@@ -467,13 +507,25 @@ class FTMSController:
         return False
 
     async def _request_control(self) -> bool:
-        """Request control of the fitness machine."""
+        """Request control of the fitness machine.
+
+        Some KingSmith firmware (e.g. MC-21) rejects REQUEST_CONTROL with
+        OPERATION_FAILED / CONTROL_NOT_PERMITTED but still accepts the
+        commands that follow. KS Fit ignores the failure and proceeds; we
+        do the same — `_has_control` is set regardless of the response so
+        every subsequent command doesn't keep retrying a call we know will
+        fail. See issue #1.
+        """
         result = await self._write_control_point(FTMSOpcode.REQUEST_CONTROL)
+        self._has_control = True
         if result:
-            self._has_control = True
             _LOGGER.info("FTMS: Control acquired")
         else:
-            _LOGGER.warning("FTMS: Failed to acquire control")
+            _LOGGER.warning(
+                "FTMS: REQUEST_CONTROL was rejected — proceeding anyway "
+                "(some KingSmith firmware refuses this command but still "
+                "accepts START_OR_RESUME / STOP_OR_PAUSE)"
+            )
         return result
 
     async def start(self) -> bool:

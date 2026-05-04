@@ -22,6 +22,13 @@ SUPPLEMENT_SERVICE_UUID = "24e2521c-f63b-48ed-85be-c5330a00fdf7"
 SUPPLEMENT_NOTIFY_UUID = "24e2521c-f63b-48ed-85be-c5330b00fdf7"
 SUPPLEMENT_WRITE_UUID = "24e2521c-f63b-48ed-85be-c5330d00fdf7"
 
+# KingSmith MC-21 vendor pre-amble. KS Fit writes a fixed 8-byte payload to
+# this characteristic (located inside the FTMS service) before every Control
+# Point command. Without it, MC-21 firmware rejects SET_TARGET_SPEED with
+# CONTROL_NOT_PERMITTED. See issue #1.
+KINGSMITH_VENDOR_PREAMBLE_UUID = "d18d2c10-c44c-11e8-a355-529269fb1459"
+KINGSMITH_VENDOR_PREAMBLE_PAYLOAD = bytes.fromhex("01000d00060b0f0d")
+
 # Legacy WiLink Service (for older devices)
 WILINK_SERVICE_UUID = "0000fe00-0000-1000-8000-00805f9b34fb"
 
