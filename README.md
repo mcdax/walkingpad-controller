@@ -11,7 +11,7 @@ Supports both **FTMS** (Fitness Machine Service) and legacy **WiLink** protocols
 - **Real-time status** — speed, distance, duration, calories, steps via BLE notifications
 - **Cold-start handling** — waits for belt to start moving and stabilize before sending speed commands, avoiding BLE disconnects on KingSmith devices
 - **Reconnect recovery** — pending target speed is automatically re-applied after BLE reconnection
-- **KingSmith extensions** — step counter via proprietary FTMS extension (bit 13), MC-21 vendor pre-amble for `SET_TARGET_SPEED`, supplement service detection (KS-HD-*)
+- **KingSmith vendor extensions** — step counter (FTMS bit 13), MC-21 vendor pre-amble, supplement service detection
 - **Firmware version** — exposed via `controller.firmware_version` (FTMS only)
 
 ## Installation
@@ -147,15 +147,13 @@ For advanced use, you can use the protocol controllers directly:
 KingSmith FTMS devices require a `START_OR_RESUME` command before the belt will accept speed commands. The library handles this automatically: it sends START, waits for the belt to report speed > 0 via treadmill data notifications, then waits an additional stabilization period before sending `SET_TARGET_SPEED`. This avoids the BLE disconnects that occur when speed commands are sent too early during motor startup.
 
 ### BLE Connection Drops
-KingSmith FTMS devices may occasionally drop the BLE connection after a cold start due to firmware limitations. The library stores the pending target speed and automatically re-applies it after reconnection (with appropriate stabilization delay). When used with the Home Assistant integration's "Stay Connected" mode, this provides seamless recovery.
+KingSmith FTMS devices may occasionally drop the connection after a cold start. The library stores the pending target speed and re-applies it after reconnection.
 
 ### Connection Exclusivity
-Only one BLE client can connect to the treadmill at a time. If Home Assistant holds the connection, the KS Fit app cannot connect, and vice versa.
+Only one BLE client can connect to the treadmill at a time — KS Fit and any client of this library are mutually exclusive.
 
 ### MC-21 Vendor Pre-amble
-The KingSmith MC-21 family (`KS-MC21-*`, `KS-SMC21C-*`, `ZP-ZEALR1-*`) refuses standard FTMS `REQUEST_CONTROL` and rejects `SET_TARGET_SPEED` unless a fixed 8-byte payload is first written to a vendor characteristic (`d18d2c10-…`) embedded in the FTMS service. This library detects the characteristic on connect and replays the pre-amble before each Control Point command — matching what the official KS Fit app does. On these devices, command success is signalled via Fitness Machine Status (`0x2ADA`) events rather than Control Point indications; the library races both signals and accepts whichever arrives first.
-
-For the full reverse-engineering analysis, see [docs/ftms-protocol-reference.md](docs/ftms-protocol-reference.md) and [docs/ks-fit-reverse-engineering.md](docs/ks-fit-reverse-engineering.md).
+The MC-21 family (`KS-MC21-*`, `KS-SMC21C-*`, `ZP-ZEALR1-*`) requires a vendor pre-amble before each FTMS Control Point command, and acks via Fitness Machine Status events rather than Control Point indications. The library detects this and handles it transparently. See [docs/ftms-protocol-reference.md](docs/ftms-protocol-reference.md) for the protocol details and [docs/ks-fit-reverse-engineering.md](docs/ks-fit-reverse-engineering.md) for the analysis.
 
 ## Requirements
 
