@@ -466,6 +466,13 @@ class FTMSController:
             "FTMS: Machine status event: 0x%02x (data: %s)", opcode, data.hex()
         )
 
+        # Record the most-recent event so callers can read it via
+        # `controller.status.last_fm_event` and fan out to the status
+        # callbacks (e.g. HA coordinator).
+        self._status.last_fm_event = opcode
+        self._status.timestamp = time.time()
+        self._notify_status()
+
         # Wake any pending command waiter that's expecting this opcode.
         if (
             self._status_ack_expected_opcode is not None
@@ -514,6 +521,13 @@ class FTMSController:
             status_code,
             data.hex(),
         )
+
+        # Push the new status code into TreadmillStatus and fan out so
+        # downstream consumers (HA coordinator) see the change.
+        if self._status.training_status != status_code:
+            self._status.training_status = status_code
+            self._status.timestamp = time.time()
+            self._notify_status()
 
     def _on_control_point_response(self, sender: int, data: bytearray) -> None:
         """Handle FTMS Control Point (2AD9) indication responses.

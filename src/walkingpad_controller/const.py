@@ -102,6 +102,31 @@ class FTMSStopPauseParam(IntEnum):
 
 
 @unique
+class FTMSTrainingStatus(IntEnum):
+    """Training Status (0x2AD3) status codes — Bluetooth SIG FTMS standard.
+
+    KingSmith firmware emits a subset of these. The first byte of the 2AD3
+    payload is the flags byte; the second byte is one of these codes.
+    """
+
+    OTHER = 0x00
+    IDLE = 0x01
+    WARMING_UP = 0x02
+    LOW_INTENSITY_INTERVAL = 0x03
+    HIGH_INTENSITY_INTERVAL = 0x04
+    RECOVERY_INTERVAL = 0x05
+    ISO_METRIC = 0x06
+    HEART_RATE_CONTROL = 0x07
+    FITNESS_TEST = 0x08
+    SPEED_OUT_OF_CONTROL = 0x09
+    COOL_DOWN = 0x0A
+    WATT_CONTROL = 0x0B
+    MANUAL_MODE = 0x0C
+    PRE_WORKOUT = 0x0D
+    POST_WORKOUT = 0x0E
+
+
+@unique
 class FitnessMachineStatusOpcode(IntEnum):
     """Fitness Machine Status (0x2ADA) event opcodes.
 

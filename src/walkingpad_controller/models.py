@@ -40,6 +40,19 @@ class TreadmillStatus:
     heart_rate: int = 0
     """Heart rate in bpm (if available, 0 otherwise)."""
 
+    training_status: int = 0
+    """FTMS Training Status (0x2AD3) status code. Standard FTMS enum:
+    0=other, 1=idle, 2=warming up, 3=low-intensity interval,
+    4=high-intensity interval, 5=recovery, 6=isometric, 7=heart-rate control,
+    8=fitness test, 9=speed out of control, 10=cool down, 11=watt control,
+    12=manual mode, 13=pre-workout, 14=post-workout. Stays 0 if the device
+    doesn't expose 0x2AD3."""
+
+    last_fm_event: int = 0
+    """Opcode of the most recent Fitness Machine Status (0x2ADA) event.
+    See `FitnessMachineStatusOpcode` for known values; 0 means no event
+    has been received yet this session."""
+
     timestamp: float = field(default_factory=time.time)
     """Wall-clock time when this status was received."""
 
