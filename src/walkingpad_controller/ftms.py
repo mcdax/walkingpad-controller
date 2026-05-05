@@ -85,6 +85,13 @@ class FTMSController:
         self._cp_response_event = asyncio.Event()
         self._cp_response_data: bytes = b""
 
+        # KingSmith firmware fires its current state on the 0x2ADA char as
+        # soon as the CCCD is enabled — typically a stale STOPPED_OR_PAUSED
+        # event from before HA connected. Skipping the first event after
+        # subscribe prevents `last_fm_event` from showing this stale value
+        # on every reconnect. See FTMS reverse-engineering doc, §6.3.
+        self._machine_status_first_event_skipped = False
+
         # Fitness Machine Status (2ADA) ack — used on the vendor pre-amble
         # path, where most Control Point opcodes are acknowledged via a
         # status event rather than a CP indication.
@@ -209,6 +216,9 @@ class FTMSController:
         _LOGGER.warning("FTMS: Device disconnected")
         self._connected = False
         self._has_control = False
+        # Re-arm the first-event skip so the next connection's stale
+        # 2ADA replay is also dropped.
+        self._machine_status_first_event_skipped = False
         for cb in self._disconnect_callbacks:
             try:
                 cb()
@@ -465,6 +475,24 @@ class FTMSController:
         _LOGGER.debug(
             "FTMS: Machine status event: 0x%02x (data: %s)", opcode, data.hex()
         )
+
+        # The very first 2ADA event after subscribing is the device replaying
+        # its current state — typically a stale STOPPED_OR_PAUSED carried over
+        # from before we connected. Skip it so `last_fm_event` doesn't flip
+        # to a misleading value on every reconnect. Wake any pending CP
+        # waiter though, in case our command actually elicited the event.
+        if not self._machine_status_first_event_skipped:
+            self._machine_status_first_event_skipped = True
+            _LOGGER.debug(
+                "FTMS: Ignoring first 2ADA event after subscribe (opcode 0x%02x)",
+                opcode,
+            )
+            if (
+                self._status_ack_expected_opcode is not None
+                and opcode == self._status_ack_expected_opcode
+            ):
+                self._status_ack_event.set()
+            return
 
         # Record the most-recent event so callers can read it via
         # `controller.status.last_fm_event` and fan out to the status
