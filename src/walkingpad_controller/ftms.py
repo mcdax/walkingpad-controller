@@ -177,16 +177,31 @@ class FTMSController:
 
         _LOGGER.info("FTMS: Connected to %s", ble_device.address)
 
-        # Discover services and log them
+        # Discover services so we can detect supplement / vendor pre-amble
+        # characteristics. Local (BlueZ-cached) — no extra GATT round-trips.
         await self._discover_services()
 
-        # Read device capabilities
+        # Read device capabilities (Speed Range, FTMS Feature, Software
+        # Revision). Bisection in tests/probe_setup_killer.py showed pure
+        # GATT reads aren't the destabilising operations; the suspect ones
+        # are CCCD writes (subscribe) and the REQUEST_CONTROL Control-Point
+        # write. Keep the reads — they give callers the real ranges.
         await self._read_capabilities()
 
-        # Subscribe to notifications
+        # Subscribe to the minimum needed for command-and-ack flow.
+        # Training Status (0x2AD3) used to be subscribed here too but it's
+        # informational only; dropping it cuts one CCCD write off the
+        # connect critical path on marginal-signal hardware (e.g. KS-HD-Z1D
+        # at -83 dBm RSSI).
         await self._subscribe_notifications()
 
-        # Request control
+        # Send REQUEST_CONTROL. We previously experimented with skipping
+        # this (we ignore the response anyway), but on KS-HD-Z1D the
+        # device silently rejects subsequent SET_TARGET_SPEED / STOP
+        # writes if it never observed REQUEST_CONTROL — the firmware
+        # tracks the request even though it doesn't always indicate.
+        # Keep this on the connect critical path. `_has_control` is
+        # set to True regardless of the response per issue #1.
         await self._request_control()
 
         # Sanity check: if the link dropped at any point during setup
@@ -335,10 +350,21 @@ class FTMSController:
         if not self._client:
             return
 
+        # Minimal connect-path subscription set:
+        #   - Treadmill Data: live speed/distance/etc (essential)
+        #   - Fitness Machine Status: command-applied notifications (essential
+        #     for verifying start/stop/set-speed without relying solely on
+        #     CP indications)
+        #   - Control Point: indications for command-and-ack flow (essential)
+        #
+        # Training Status (0x2AD3) was removed from the connect path. It's
+        # informational only (PRE_WORKOUT / MANUAL / etc), the lib doesn't
+        # gate any decision on it, and dropping it cuts one CCCD write from
+        # the critical setup. Callers who want it can call
+        # subscribe_training_status() lazily.
         subscriptions = (
             (TREADMILL_DATA_UUID, self._on_treadmill_data, "Treadmill Data", 0.10),
             (FITNESS_MACHINE_STATUS_UUID, self._on_machine_status, "Fitness Machine Status", 0.20),
-            (TRAINING_STATUS_UUID, self._on_training_status, "Training Status", 0.30),
             (FTMS_CONTROL_POINT_UUID, self._on_control_point_response, "Control Point", 0.0),
         )
 
