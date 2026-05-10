@@ -49,8 +49,18 @@ class WiLinkController:
 
     @property
     def connected(self) -> bool:
-        """Return whether the device is connected."""
-        return self._connected
+        """Return whether the device is connected.
+
+        Defers to the underlying BleakClient so an unilateral disconnect
+        (firmware drop, range loss) is reflected even if our disconnect
+        callback hasn't fired yet.
+        """
+        if not self._connected:
+            return False
+        client = getattr(self._controller, "client", None)
+        if client is not None and not client.is_connected:
+            return False
+        return True
 
     @property
     def status(self) -> TreadmillStatus:
@@ -123,6 +133,32 @@ class WiLinkController:
         await self._controller.run(ble_device)
         self._connected = True
         _LOGGER.info("WiLink: Connected to %s", ble_device.address)
+        # Attach a disconnect callback to ph4's internal BleakClient so the
+        # upper layers learn about a unilateral BLE drop (range loss,
+        # firmware reboot, phone app stealing the link) and can trigger a
+        # reconnect. Without this, `_disconnect_callbacks` are never fired
+        # and `_connected` stays True forever after a real drop.
+        client = getattr(self._controller, "client", None)
+        if client is not None:
+            try:
+                client.set_disconnected_callback(self._on_ble_disconnect)
+            except (AttributeError, NotImplementedError):
+                # Bleak removed set_disconnected_callback in a future
+                # release; fall through and rely on `connected` polling.
+                _LOGGER.debug(
+                    "WiLink: Bleak set_disconnected_callback unavailable; "
+                    "disconnect events will only surface via connected polls"
+                )
+
+    def _on_ble_disconnect(self, client) -> None:
+        """Handle BLE disconnect from the underlying ph4 BleakClient."""
+        _LOGGER.warning("WiLink: BLE link dropped")
+        self._connected = False
+        for cb in self._disconnect_callbacks:
+            try:
+                cb()
+            except Exception:
+                _LOGGER.exception("Error in disconnect callback")
 
     async def disconnect(self) -> None:
         """Disconnect from the device."""

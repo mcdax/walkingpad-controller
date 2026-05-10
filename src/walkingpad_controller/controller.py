@@ -309,10 +309,20 @@ class WalkingPadController:
         await self._wilink.connect(self._ble_device)
 
     async def disconnect(self) -> None:
-        """Disconnect from the device."""
-        if not self._connected:
-            return
+        """Disconnect from the device.
+
+        Always tear down a live backend if one exists — relying solely on
+        the cached ``_connected`` flag misses the case where the firmware
+        unilaterally dropped the link (so our callback flipped the cache
+        to False) but Bleak still holds an open client we need to close.
+        """
         async with self._lock:
+            backend_alive = (
+                (self._ftms is not None and self._ftms.connected)
+                or (self._wilink is not None and self._wilink.connected)
+            )
+            if not self._connected and not backend_alive:
+                return
             try:
                 if self._ftms:
                     await self._ftms.disconnect()
@@ -411,8 +421,11 @@ class WalkingPadController:
                 # Belt already running — safe to send speed directly
                 return await self._ftms.set_target_speed(speed_kmh)
             else:
-                # Belt is stopped — start it first.  The user will need
-                # to set the desired speed once the belt is running.
+                # Belt is stopped — start it first, then send the requested
+                # target speed once spin-up has completed. Sending the
+                # target speed during the cold-start window crashes the
+                # BLE connection on KingSmith firmware, so `start()` blocks
+                # until speed > 0 before we proceed here.
                 _LOGGER.info(
                     "Belt is stopped — starting first, then setting speed %.1f",
                     speed_kmh,
@@ -420,7 +433,6 @@ class WalkingPadController:
                 started = await self._ftms.start()
                 if not started:
                     return False
-                # Belt is now running; send the speed command
                 return await self._ftms.set_target_speed(speed_kmh)
 
         elif self._wilink:
