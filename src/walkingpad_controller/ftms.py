@@ -410,15 +410,20 @@ class FTMSController:
         speed_raw = struct.unpack_from("<H", data, offset)[0]
         self._status.speed = speed_raw / 100.0
         # Belt state derivation:
-        #   speed > 0           -> ACTIVE (also clears any pending pause flag,
-        #                           since the belt is moving again)
+        #   speed > 0           -> ACTIVE
         #   speed = 0 + paused  -> PAUSED (session alive, awaiting resume)
         #   speed = 0 + ~paused -> STOPPED (session ended or never started)
-        # The `_paused` flag is set by _on_machine_status when the device
-        # emits STOPPED_OR_PAUSED with PAUSE param.
+        #
+        # `_paused` is set/cleared exclusively by `_on_machine_status` in
+        # response to FM Status events — NOT here. The previous version
+        # cleared it on every speed > 0 frame, which raced with the
+        # deceleration window after PAUSE: the FM Status PAUSE event
+        # would set _paused = True at speed ≈ 2.5, then every Treadmill
+        # Data frame during the 5-10 s decel cleared it again, leaving
+        # _paused = False by the time speed reached 0 and belt_state
+        # mis-reporting STOPPED instead of PAUSED.
         if speed_raw > 0:
             self._status.belt_state = BeltState.ACTIVE
-            self._paused = False
         elif self._paused:
             self._status.belt_state = BeltState.PAUSED
         else:
@@ -525,23 +530,41 @@ class FTMSController:
             "FTMS: Machine status event: 0x%02x (data: %s)", opcode, data.hex()
         )
 
-        # The very first 2ADA event after subscribing is the device replaying
-        # its current state — typically a stale STOPPED_OR_PAUSED carried over
-        # from before we connected. Skip it so `last_fm_event` doesn't flip
-        # to a misleading value on every reconnect. Wake any pending CP
-        # waiter though, in case our command actually elicited the event.
+        # The very first 2ADA event after subscribing is sometimes the
+        # device replaying its prior state — typically a stale
+        # STOPPED_OR_PAUSED carried over from before we connected. We
+        # used to drop that unconditionally so `last_fm_event` wouldn't
+        # flap on every reconnect.
+        #
+        # That over-filtered when the user's first command lands an ack
+        # *as* the first event: e.g. pause() right after a fresh
+        # connect → the FM Status PAUSE arrives before any other event,
+        # and dropping it lost the `_paused = True` state update,
+        # leaving belt_state derived as STOPPED instead of PAUSED.
+        #
+        # Heuristic: if the first event matches what we're currently
+        # waiting for, treat it as the real ack and apply state
+        # changes (fall through). Otherwise skip — most likely a
+        # stale replay.
         if not self._machine_status_first_event_skipped:
             self._machine_status_first_event_skipped = True
-            _LOGGER.debug(
-                "FTMS: Ignoring first 2ADA event after subscribe (opcode 0x%02x)",
-                opcode,
-            )
             if (
                 self._status_ack_expected_opcode is not None
                 and opcode == self._status_ack_expected_opcode
             ):
-                self._status_ack_event.set()
-            return
+                _LOGGER.debug(
+                    "FTMS: First 2ADA event after subscribe matches expected "
+                    "ack opcode 0x%02x — treating as real ack, not stale replay",
+                    opcode,
+                )
+                # Fall through to the normal handler below.
+            else:
+                _LOGGER.debug(
+                    "FTMS: Ignoring first 2ADA event after subscribe "
+                    "(opcode 0x%02x, no matching pending command)",
+                    opcode,
+                )
+                return
 
         # Record the most-recent event so callers can read it via
         # `controller.status.last_fm_event` and fan out to the status
