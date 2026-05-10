@@ -31,6 +31,7 @@ from typing import Callable
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
+from bleak_retry_connector import establish_connection
 
 from .const import (
     FITNESS_MACHINE_STATUS_UUID,
@@ -178,10 +179,18 @@ class FTMSController:
         """
         _LOGGER.info("FTMS: Connecting to %s", ble_device.address)
 
-        self._client = BleakClient(
-            ble_device, disconnected_callback=self._on_disconnect
+        # bleak_retry_connector wraps BleakClient.connect with HA-tuned retry
+        # heuristics — slot management, scanner re-discovery, ESPHome BT-proxy
+        # reliability fixes. Hand-rolled `BleakClient(...).connect()` works
+        # but is fragile against `ESP_GATT_CONN_FAIL_ESTABLISH` / no-slot
+        # conditions, which is exactly the failure mode KingSmith devices hit
+        # at marginal RSSI through ESPHome proxies.
+        self._client = await establish_connection(
+            BleakClient,
+            ble_device,
+            ble_device.name or ble_device.address,
+            disconnected_callback=self._on_disconnect,
         )
-        await self._client.connect()
         self._connected = True
 
         _LOGGER.info("FTMS: Connected to %s", ble_device.address)

@@ -36,6 +36,7 @@ from typing import Callable
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
+from bleak_retry_connector import establish_connection
 
 from .const import (
     FTMS_NAME_PREFIXES,
@@ -234,13 +235,24 @@ class WalkingPadController:
     async def _detect_protocol_from_probe(self) -> ProtocolType:
         """Detect protocol by probing BLE services."""
         _LOGGER.info("Probing protocol for %s", self._ble_device.address)
+        client: BleakClient | None = None
         try:
-            async with BleakClient(self._ble_device) as client:
-                service_uuids = {s.uuid.lower() for s in client.services}
-                return self._detect_protocol_from_services(service_uuids)
+            client = await establish_connection(
+                BleakClient,
+                self._ble_device,
+                self._name,
+            )
+            service_uuids = {s.uuid.lower() for s in client.services}
+            return self._detect_protocol_from_services(service_uuids)
         except (BleakError, TimeoutError) as err:
             _LOGGER.warning("Protocol detection failed: %s", err)
             return ProtocolType.UNKNOWN
+        finally:
+            if client is not None and client.is_connected:
+                try:
+                    await client.disconnect()
+                except BleakError:
+                    pass
 
     # --- Connection ---
 
