@@ -349,7 +349,12 @@ class WalkingPadController:
         return False
 
     async def stop(self) -> bool:
-        """Stop the treadmill.
+        """Stop the treadmill — full session end. Counters reset.
+
+        On FTMS this sends `STOP_OR_PAUSE` with the STOP parameter (0x01).
+        For most user-facing UIs you probably want `pause()` instead — that
+        matches the phone-app and physical-remote behaviour where pressing
+        the stop button leaves the session live and resumable.
 
         Returns:
             True if the command was sent successfully.
@@ -357,6 +362,32 @@ class WalkingPadController:
         if self._ftms:
             return await self._ftms.stop()
         elif self._wilink:
+            return await self._wilink.stop()
+
+        _LOGGER.warning("No protocol backend available")
+        return False
+
+    async def pause(self) -> bool:
+        """Pause the treadmill — session stays live, can be resumed.
+
+        On FTMS this sends `STOP_OR_PAUSE` with the PAUSE parameter (0x02).
+        The device decelerates to zero but preserves session counters
+        (time, distance, calories, steps) so a subsequent `start()` resumes
+        from where the user left off — same behaviour as pressing the
+        physical stop button or the stop button in KS Fit.
+
+        On the legacy WiLink protocol there is no separate pause opcode;
+        we fall back to stop() and log a warning.
+
+        Returns:
+            True if the command was sent successfully.
+        """
+        if self._ftms:
+            return await self._ftms.pause()
+        elif self._wilink:
+            _LOGGER.warning(
+                "WiLink protocol has no separate pause; falling back to stop"
+            )
             return await self._wilink.stop()
 
         _LOGGER.warning("No protocol backend available")
