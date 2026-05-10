@@ -48,10 +48,19 @@ class ProtocolType(Enum):
 
 @unique
 class BeltState(IntEnum):
-    """Belt states."""
+    """Belt states.
+
+    PAUSED is distinct from STOPPED: the device decelerates to speed 0,
+    but the session counters (time, distance, calories, steps) are
+    preserved and a subsequent START_OR_RESUME continues the session.
+    Set when the firmware emits FM Status STOPPED_OR_PAUSED with the
+    PAUSE param (0x02) — the same event the phone app and the physical
+    remote produce when the user presses their stop button.
+    """
 
     STOPPED = 0
     ACTIVE = 1
+    PAUSED = 2
     STANDBY = 5
     STARTING = 9
     UNKNOWN = 1000

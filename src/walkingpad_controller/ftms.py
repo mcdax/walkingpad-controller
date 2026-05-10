@@ -43,6 +43,7 @@ from .const import (
     SUPPORTED_SPEED_RANGE_UUID,
     TRAINING_STATUS_UUID,
     TREADMILL_DATA_UUID,
+    BeltState,
     FitnessMachineStatusOpcode,
     FTMSOpcode,
     FTMSResultCode,
@@ -97,6 +98,14 @@ class FTMSController:
         # status event rather than a CP indication.
         self._status_ack_event = asyncio.Event()
         self._status_ack_expected_opcode: int | None = None
+
+        # True between a `STOPPED_OR_PAUSED + PAUSE` FM Status event and
+        # the next `STARTED_OR_RESUMED` / `STOPPED_OR_PAUSED + STOP` /
+        # safety-stop event. Used by `_on_treadmill_data` to derive
+        # `belt_state = PAUSED` when speed reads 0 instead of the
+        # default STOPPED — so HA can distinguish "session paused, will
+        # resume" from "session ended, counters reset on next start".
+        self._paused: bool = False
 
     @property
     def connected(self) -> bool:
@@ -231,6 +240,7 @@ class FTMSController:
         _LOGGER.warning("FTMS: Device disconnected")
         self._connected = False
         self._has_control = False
+        self._paused = False
         # Re-arm the first-event skip so the next connection's stale
         # 2ADA replay is also dropped.
         self._machine_status_first_event_skipped = False
@@ -399,7 +409,20 @@ class FTMSController:
         # Instantaneous Speed - always present (UINT16, 0.01 km/h)
         speed_raw = struct.unpack_from("<H", data, offset)[0]
         self._status.speed = speed_raw / 100.0
-        self._status.belt_state = 1 if speed_raw > 0 else 0
+        # Belt state derivation:
+        #   speed > 0           -> ACTIVE (also clears any pending pause flag,
+        #                           since the belt is moving again)
+        #   speed = 0 + paused  -> PAUSED (session alive, awaiting resume)
+        #   speed = 0 + ~paused -> STOPPED (session ended or never started)
+        # The `_paused` flag is set by _on_machine_status when the device
+        # emits STOPPED_OR_PAUSED with PAUSE param.
+        if speed_raw > 0:
+            self._status.belt_state = BeltState.ACTIVE
+            self._paused = False
+        elif self._paused:
+            self._status.belt_state = BeltState.PAUSED
+        else:
+            self._status.belt_state = BeltState.STOPPED
         offset += 2
 
         # Average Speed (bit 1)
@@ -538,12 +561,25 @@ class FTMSController:
             if len(data) >= 2:
                 if data[1] == FTMSStopPauseParam.STOP:
                     _LOGGER.info("FTMS: Treadmill stopped by user")
+                    self._paused = False
+                    # Treadmill Data with speed=0 will follow shortly and
+                    # set belt_state = STOPPED via the speed-0 + ~paused
+                    # branch; no need to write it here.
                 elif data[1] == FTMSStopPauseParam.PAUSE:
                     _LOGGER.info("FTMS: Treadmill paused by user")
+                    self._paused = True
+                    # Belt is still decelerating at this moment — TM Data
+                    # will keep belt_state = ACTIVE while speed > 0, then
+                    # transition to PAUSED when it reaches zero.
         elif opcode == FitnessMachineStatusOpcode.STOPPED_BY_SAFETY_KEY:
             _LOGGER.info("FTMS: Treadmill stopped by safety key")
+            self._paused = False
         elif opcode == FitnessMachineStatusOpcode.STARTED_OR_RESUMED:
             _LOGGER.info("FTMS: Treadmill started/resumed by user")
+            # `_paused` will be cleared automatically when TM Data shows
+            # speed > 0; clear it here too in case TM Data hasn't arrived
+            # yet, to avoid a transient PAUSED reading right after resume.
+            self._paused = False
         elif opcode == FitnessMachineStatusOpcode.TARGET_SPEED_CHANGED:
             if len(data) >= 3:
                 speed_raw = struct.unpack_from("<H", data, 1)[0]
