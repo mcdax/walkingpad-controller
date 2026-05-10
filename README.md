@@ -11,7 +11,7 @@ Supports both **FTMS** (Fitness Machine Service) and legacy **WiLink** protocols
 - **Real-time status** — speed, distance, duration, calories, steps via BLE notifications
 - **Cold-start handling** — waits for belt to start moving and stabilize before sending speed commands, avoiding BLE disconnects on KingSmith devices
 - **Reconnect recovery** — pending target speed is automatically re-applied after BLE reconnection
-- **KingSmith vendor extensions** — step counter (FTMS bit 13), MC-21 vendor pre-amble, supplement service detection
+- **KingSmith vendor extensions** — step counter (FTMS bit 13), vendor pre-amble (any device exposing the `d18d2c10-…` characteristic, e.g. MC-21), supplement service detection
 - **Firmware version** — exposed via `controller.firmware_version` (FTMS only)
 
 ## Installation
