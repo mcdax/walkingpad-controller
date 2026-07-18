@@ -43,6 +43,8 @@ from .const import (
     FTMS_SERVICE_UUID,
     MAX_CONNECT_RETRIES,
     RETRY_DELAY_SECONDS,
+    SPERAX_NAME_PREFIXES,
+    SPERAX_SERVICE_UUID,
     WILINK_SERVICE_UUID,
     OperatingMode,
     ProtocolType,
@@ -74,6 +76,7 @@ class WalkingPadController:
         # Protocol backends
         self._ftms: FTMSController | None = None
         self._wilink = None  # WiLinkController (lazy import)
+        self._sperax = None  # SperaxController (lazy import)
 
         # Status callbacks
         self._status_callbacks: list[Callable[[TreadmillStatus], None]] = []
@@ -113,6 +116,8 @@ class WalkingPadController:
             return self._ftms.connected
         if self._wilink is not None:
             return self._wilink.connected
+        if self._sperax is not None:
+            return self._sperax.connected
         return self._connected
 
     @property
@@ -122,6 +127,8 @@ class WalkingPadController:
             return self._ftms.status
         if self._wilink:
             return self._wilink.status
+        if self._sperax:
+            return self._sperax.status
         return TreadmillStatus()
 
     @property
@@ -131,6 +138,8 @@ class WalkingPadController:
             return self._ftms.min_speed
         if self._wilink:
             return self._wilink.min_speed
+        if self._sperax:
+            return self._sperax.min_speed
         return 0.5
 
     @property
@@ -140,6 +149,8 @@ class WalkingPadController:
             return self._ftms.max_speed
         if self._wilink:
             return self._wilink.max_speed
+        if self._sperax:
+            return self._sperax.max_speed
         return 6.0
 
     @property
@@ -149,14 +160,16 @@ class WalkingPadController:
             return self._ftms.speed_increment
         if self._wilink:
             return self._wilink.speed_increment
+        if self._sperax:
+            return self._sperax.speed_increment
         return 0.1
 
     @property
     def firmware_version(self) -> str:
-        """Firmware version string, or empty if unavailable.
+        """Firmware string, or empty if unavailable.
 
         Read from Software Revision String (`0x2A28`) on FTMS devices.
-        Returns an empty string for WiLink devices (not implemented).
+        Returns an empty string for WiLink and Sperax devices (not implemented).
         """
         if self._ftms:
             return self._ftms.firmware_version
@@ -212,12 +225,21 @@ class WalkingPadController:
                     prefix,
                 )
                 return ProtocolType.FTMS
+        for prefix in SPERAX_NAME_PREFIXES:
+            if ble_name.startswith(prefix):
+                _LOGGER.info(
+                    "Detected Sperax protocol from BLE name '%s' (prefix '%s')",
+                    ble_name,
+                    prefix,
+                )
+                return ProtocolType.SPERAX
         return None
 
     def _detect_protocol_from_services(self, service_uuids: set[str]) -> ProtocolType:
         """Determine the protocol based on discovered service UUIDs."""
         has_ftms = FTMS_SERVICE_UUID.lower() in service_uuids
         has_wilink = WILINK_SERVICE_UUID.lower() in service_uuids
+        has_sperax = SPERAX_SERVICE_UUID.lower() in service_uuids
 
         if has_ftms and not has_wilink:
             _LOGGER.info("Detected FTMS protocol (no WiLink service)")
@@ -228,6 +250,9 @@ class WalkingPadController:
         elif has_ftms:
             _LOGGER.info("Detected FTMS protocol (with WiLink fallback)")
             return ProtocolType.FTMS
+        elif has_sperax:
+            _LOGGER.info("Detected Sperax protocol (service 0xFFF0)")
+            return ProtocolType.SPERAX
         else:
             _LOGGER.warning("No known protocol detected")
             return ProtocolType.UNKNOWN
@@ -281,6 +306,8 @@ class WalkingPadController:
                 await self._connect_ftms()
             elif self._protocol == ProtocolType.WILINK:
                 await self._connect_wilink()
+            elif self._protocol == ProtocolType.SPERAX:
+                await self._connect_sperax()
             else:
                 raise RuntimeError(
                     f"Unknown protocol for device {self._ble_device.address}"
@@ -320,6 +347,30 @@ class WalkingPadController:
         self._wilink.register_disconnect_callback(self._on_disconnect)
         await self._wilink.connect(self._ble_device)
 
+    async def _connect_sperax(self) -> None:
+        """Connect using the Sperax / WLT6200 protocol with retry logic."""
+        from .sperax import SperaxController
+
+        last_error: Exception | None = None
+        for attempt in range(1, MAX_CONNECT_RETRIES + 1):
+            try:
+                self._sperax = SperaxController()
+                self._sperax.register_status_callback(self._on_status_update)
+                self._sperax.register_disconnect_callback(self._on_disconnect)
+                await self._sperax.connect(self._ble_device)
+                return
+            except (BleakError, TimeoutError) as err:
+                last_error = err
+                _LOGGER.warning(
+                    "Sperax connection attempt %d/%d failed: %s",
+                    attempt,
+                    MAX_CONNECT_RETRIES,
+                    err,
+                )
+                if attempt < MAX_CONNECT_RETRIES:
+                    await asyncio.sleep(RETRY_DELAY_SECONDS)
+        raise last_error  # type: ignore[misc]
+
     async def disconnect(self) -> None:
         """Disconnect from the device.
 
@@ -332,6 +383,7 @@ class WalkingPadController:
             backend_alive = (
                 (self._ftms is not None and self._ftms.connected)
                 or (self._wilink is not None and self._wilink.connected)
+                or (self._sperax is not None and self._sperax.connected)
             )
             if not self._connected and not backend_alive:
                 return
@@ -340,6 +392,8 @@ class WalkingPadController:
                     await self._ftms.disconnect()
                 elif self._wilink:
                     await self._wilink.disconnect()
+                elif self._sperax:
+                    await self._sperax.disconnect()
             except Exception:
                 _LOGGER.exception("Error during disconnect")
             finally:
@@ -367,6 +421,9 @@ class WalkingPadController:
         elif self._wilink:
             return await self._wilink.start()
 
+        elif self._sperax:
+            return await self._sperax.start()
+
         _LOGGER.warning("No protocol backend available")
         return False
 
@@ -385,6 +442,8 @@ class WalkingPadController:
             return await self._ftms.stop()
         elif self._wilink:
             return await self._wilink.stop()
+        elif self._sperax:
+            return await self._sperax.stop()
 
         _LOGGER.warning("No protocol backend available")
         return False
@@ -411,6 +470,10 @@ class WalkingPadController:
                 "WiLink protocol has no separate pause; falling back to stop"
             )
             return await self._wilink.stop()
+        elif self._sperax:
+            # Sperax has no separate pause opcode; the backend falls back to
+            # stop internally and logs it.
+            return await self._sperax.pause()
 
         _LOGGER.warning("No protocol backend available")
         return False
@@ -450,7 +513,50 @@ class WalkingPadController:
         elif self._wilink:
             return await self._wilink.set_target_speed(speed_kmh)
 
+        elif self._sperax:
+            # The WLT6200 run command carries the speed directly and there is
+            # no cold-start crash to work around, so a single call suffices
+            # whether the belt is stopped or already moving.
+            return await self._sperax.set_target_speed(speed_kmh)
+
         _LOGGER.warning("No protocol backend available")
+        return False
+
+    async def set_incline(self, incline_step: int) -> bool:
+        """Set the incline as a discrete step.
+
+        Only the Sperax / WLT6200 backend supports incline today (steps 0-2).
+        FTMS/WiLink backends return False.
+
+        Args:
+            incline_step: Incline step (0-2).
+
+        Returns:
+            True if the command was sent successfully.
+        """
+        if self._sperax:
+            return await self._sperax.set_target_inclination(incline_step)
+
+        _LOGGER.warning("Incline control not supported on this device")
+        return False
+
+    async def set_vibration(self, level: int) -> bool:
+        """Set the vibration level (0 = off, 1-4).
+
+        Only the Sperax / WLT6200 backend supports vibration. Note the belt
+        and vibration motor are mutually exclusive on the P3 Max. FTMS/WiLink
+        backends return False.
+
+        Args:
+            level: Vibration level (0 = off, 1-4).
+
+        Returns:
+            True if the command was sent successfully.
+        """
+        if self._sperax:
+            return await self._sperax.set_vibration(level)
+
+        _LOGGER.warning("Vibration control not supported on this device")
         return False
 
     async def switch_mode(self, mode: OperatingMode) -> bool:
@@ -475,6 +581,9 @@ class WalkingPadController:
         elif self._wilink:
             return await self._wilink.switch_mode(mode.value)
 
+        elif self._sperax:
+            return await self._sperax.switch_mode(mode.value)
+
         _LOGGER.warning("No protocol backend available")
         return False
 
@@ -492,6 +601,12 @@ class WalkingPadController:
                 self._connected = False
         elif self._wilink:
             await self._wilink.ask_stats()
+        elif self._sperax:
+            # Status is pushed via the poll loop; surface the latest cache.
+            if self._sperax.connected:
+                self._on_status_update(self._sperax.status)
+            else:
+                self._connected = False
 
     def update_ble_device(self, ble_device: BLEDevice) -> None:
         """Update the BLE device reference (e.g., after rediscovery).

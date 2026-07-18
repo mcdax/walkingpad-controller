@@ -1,7 +1,8 @@
 """walkingpad-controller — Python library for controlling WalkingPad treadmills over BLE.
 
-Supports both FTMS (Fitness Machine Service) and legacy WiLink protocols.
-Protocol is auto-detected based on the BLE device name and services.
+Supports FTMS (Fitness Machine Service), legacy WiLink, and the Sperax /
+wi-linktech (WLT6200) protocols. Protocol is auto-detected based on the BLE
+device name and services.
 
 Quick start:
 
@@ -20,6 +21,8 @@ Quick start:
 from .const import (
     FTMS_NAME_PREFIXES,
     FTMS_SERVICE_UUID,
+    SPERAX_NAME_PREFIXES,
+    SPERAX_SERVICE_UUID,
     WILINK_SERVICE_UUID,
     BeltState,
     FTMSOpcode,
@@ -30,6 +33,7 @@ from .const import (
 from .controller import WalkingPadController
 from .ftms import FTMSController
 from .models import DeviceCapabilities, SpeedRange, TreadmillStatus
+from .sperax import SperaxController
 from .wilink import WiLinkController
 
 __version__ = "0.4.0"
@@ -40,6 +44,7 @@ __all__ = [
     # Protocol-specific controllers
     "FTMSController",
     "WiLinkController",
+    "SperaxController",
     # Data models
     "TreadmillStatus",
     "SpeedRange",
@@ -53,5 +58,7 @@ __all__ = [
     # Constants
     "FTMS_SERVICE_UUID",
     "WILINK_SERVICE_UUID",
+    "SPERAX_SERVICE_UUID",
     "FTMS_NAME_PREFIXES",
+    "SPERAX_NAME_PREFIXES",
 ]

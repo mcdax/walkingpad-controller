@@ -33,6 +33,13 @@ KINGSMITH_VENDOR_PREAMBLE_PAYLOAD = bytes.fromhex("01000d00060b0f0d")
 # Legacy WiLink Service (for older devices)
 WILINK_SERVICE_UUID = "0000fe00-0000-1000-8000-00805f9b34fb"
 
+# Sperax / wi-linktech (WLT6200) vendor service — Sperax P3 Max walking pad.
+# Custom framed protocol (F5 .. FA, CRC-16/0xA327). Not FTMS, not WiLink.
+# See docs/sperax-p3max-protocol.md.
+SPERAX_SERVICE_UUID = "0000fff0-0000-1000-8000-00805f9b34fb"
+SPERAX_WRITE_UUID = "0000fff2-0000-1000-8000-00805f9b34fb"  # write-no-response
+SPERAX_NOTIFY_UUID = "0000fff1-0000-1000-8000-00805f9b34fb"  # notify
+
 
 # --- Enums ---
 
@@ -43,6 +50,7 @@ class ProtocolType(Enum):
 
     WILINK = "wilink"  # Legacy protocol (service 0xFE00, ph4-walkingpad)
     FTMS = "ftms"  # Standard FTMS (service 0x1826)
+    SPERAX = "sperax"  # Sperax P3 Max / wi-linktech WLT6200 (service 0xFFF0)
     UNKNOWN = "unknown"
 
 
@@ -256,6 +264,10 @@ class TreadmillDataFlags:
 # - ZP-ZEALR1-*   : Zeal-branded OEM variant of the MC-21 (KS Fit's isMC21
 #                   getter matches all three).
 FTMS_NAME_PREFIXES = ("KS-HD-", "KS-MC21-", "KS-SMC21C-", "ZP-ZEALR1-")
+
+# BLE name prefixes for the Sperax / wi-linktech (WLT6200) vendor protocol.
+# The P3 Max advertises as "SPERAX_P3MAX".
+SPERAX_NAME_PREFIXES = ("SPERAX_",)
 
 # Default connection parameters.
 # KingSmith FTMS firmware can be left in a bad state for several seconds
