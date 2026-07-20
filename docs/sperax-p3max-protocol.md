@@ -350,8 +350,13 @@ device streams `0x19` status notifications.
 - Decode the hello-response (`0x01`) fields → device limits / units.
 - Separate status counters at offsets 8 / 10 / 12 / 14 (time vs distance vs steps vs
   calories) with a longer, instrumented capture.
-- Confirm the device's true **max speed** and **max incline** (capture only reached
-  3.0 km/h / incline 2).
+- **Max speed is 12.0 km/h** (confirmed by the device owner in hass-walkingpad#3;
+  the reference capture only reached 3.0 km/h). The `<speed>` byte still follows
+  km/h × 10, so 12.0 km/h = `0x78`.
+- **Incline / decline** encoding beyond steps 0–2 is not yet captured. The P3 Max
+  advertises 15-level motorised incline *and* decline; a capture sweeping the full
+  incline range and into decline is needed to decode the `<incline>` byte (range and
+  how decline is represented — e.g. signed / offset).
 
 ---
 

@@ -138,12 +138,11 @@ _VIB_STATE_OFF = 0x00
 # the status fresh without hammering the write characteristic.
 _POLL_INTERVAL = 0.5
 
-# Speed capabilities. The reference capture only exercised up to 3.0 km/h;
-# the P3 Max spec sheet advertises 6.0 km/h. These are best-effort defaults
-# until confirmed on hardware — the device is not known to expose a readable
-# speed-range characteristic.
+# Speed capabilities. The P3 Max tops out at 12.0 km/h (confirmed by the
+# device owner in hass-walkingpad#3). The device is not known to expose a
+# readable speed-range characteristic, so these are fixed defaults.
 _MIN_SPEED = 0.5
-_MAX_SPEED = 6.0
+_MAX_SPEED = 12.0
 _SPEED_INCREMENT = 0.1
 _MAX_INCLINE = 2
 _MAX_VIBRATION = 4
@@ -346,6 +345,7 @@ class SperaxController:
             self._status.belt_state = BeltState.STOPPED
 
         self._vibration_level = inner[18]
+        self._status.vibration_level = inner[18]
 
         # Best-effort counters — NOT yet unit-verified. Exposed so callers have
         # *something* trending; treat with caution until confirmed on hardware.

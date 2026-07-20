@@ -53,6 +53,10 @@ class TreadmillStatus:
     See `FitnessMachineStatusOpcode` for known values; 0 means no event
     has been received yet this session."""
 
+    vibration_level: int = 0
+    """Vibration intensity level (0 = off, 1-4). Sperax / WLT6200 devices
+    only; stays 0 for FTMS and WiLink."""
+
     timestamp: float = field(default_factory=time.time)
     """Wall-clock time when this status was received."""
 
