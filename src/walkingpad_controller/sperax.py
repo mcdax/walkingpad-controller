@@ -17,7 +17,8 @@ framed, CRC-checked protocol:
 Commands (app -> device, char 0xFFF2, write-no-response):
   - 0x01 hello / handshake                 inner ``00 01``
   - 0x15 run control  ``00 15 <state> <speed> <incline>``
-        state 0x01=run / 0x02=stop ; speed = km/h x 10 ; incline 0/1/2
+        state 0x01=run / 0x02=pause (keep counters) / 0x00=stop (reset counters);
+        speed = km/h x 10 ; incline 0..10
   - 0x16 vibration    ``00 16 <state> <level>``   state 0x01=on/0x00=off, level 1-4
   - 0x19 status poll / keep-alive          inner ``00 19``
 
@@ -128,10 +129,19 @@ _CMD_VIBRATION = 0x16
 _CMD_STATUS = 0x19
 _CMD_ACK = 0xD0
 
+# Run-command state byte (2nd arg of 0x15). Confirmed in hass-walkingpad#3:
+#   0x01 = run, 0x02 = pause (belt stops, session counters kept),
+#   0x00 = stop (belt stops AND steps/distance/time reset to 0).
 _RUN_STATE_RUN = 0x01
-_RUN_STATE_STOP = 0x02
+_RUN_STATE_PAUSE = 0x02
+_RUN_STATE_STOP = 0x00
 _VIB_STATE_ON = 0x01
 _VIB_STATE_OFF = 0x00
+
+# Status-frame state byte (offset 4). 0x50 means the device is in vibration
+# mode; the vibration-level field (offset 18) retains its last value even
+# after vibration is turned off, so it's only meaningful in this state.
+_STATUS_STATE_VIBRATION = 0x50
 
 # How often to poll the device. The WLT6200 only streams status while it is
 # being polled; the official app polls ~3x/s. 0.5 s keeps the link alive and
@@ -344,8 +354,13 @@ class SperaxController:
         else:
             self._status.belt_state = BeltState.STOPPED
 
-        self._vibration_level = inner[18]
-        self._status.vibration_level = inner[18]
+        # The vibration-level field (offset 18) holds the *last selected*
+        # level and is not cleared when vibration turns off — the device
+        # signals "vibration active" via the state byte (offset 4 == 0x50).
+        # Report a level only while actually vibrating, else 0.
+        vib = inner[18] if inner[4] == _STATUS_STATE_VIBRATION else 0
+        self._vibration_level = vib
+        self._status.vibration_level = vib
         self._status.incline = inner[16]
 
         # Best-effort counters — NOT yet unit-verified. Exposed so callers have
@@ -391,7 +406,13 @@ class SperaxController:
         return await self._send_run()
 
     async def stop(self) -> bool:
-        """Stop the belt (``15 02 00 00``)."""
+        """Stop the belt and end the session (``15 00 00 00``).
+
+        This is the full stop: the belt stops AND the device resets its
+        session counters (steps / distance / time) to 0 — matching the FTMS
+        backend's stop() semantics. Use pause() to stop the belt while keeping
+        the running totals.
+        """
         try:
             await self._write(bytes([0x00, _CMD_RUN, _RUN_STATE_STOP, 0x00, 0x00]))
             return True
@@ -400,13 +421,18 @@ class SperaxController:
             return False
 
     async def pause(self) -> bool:
-        """Pause the belt.
+        """Pause the belt, keeping the session (``15 02 00 00``).
 
-        The WLT6200 protocol has no separate pause opcode, so this falls back
-        to stop() — same approach the WiLink backend takes.
+        The belt stops but the device preserves its session counters
+        (steps / distance / time), so a subsequent start() continues the
+        session — matching the FTMS backend's pause() semantics.
         """
-        _LOGGER.debug("Sperax: no pause opcode; falling back to stop")
-        return await self.stop()
+        try:
+            await self._write(bytes([0x00, _CMD_RUN, _RUN_STATE_PAUSE, 0x00, 0x00]))
+            return True
+        except BleakError as err:
+            _LOGGER.warning("Sperax: pause failed: %s", err)
+            return False
 
     async def set_target_speed(self, speed_kmh: float) -> bool:
         """Set the belt speed in km/h."""

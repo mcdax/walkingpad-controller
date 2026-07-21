@@ -86,3 +86,26 @@ def test_status_parse_running():
     assert ctrl.status.speed == 3.0
     assert ctrl.status.belt_state == BeltState.ACTIVE
     assert ctrl.vibration_level == 0
+
+
+def test_stop_and_pause_frames():
+    # stop resets counters (state 0x00); pause keeps them (state 0x02).
+    assert encode(bytes([0x00, 0x15, 0x00, 0x00, 0x00])).hex() == "f50a0015000000d301fa"
+    # pause frame matches the real capture byte-for-byte.
+    assert encode(bytes([0x00, 0x15, 0x02, 0x00, 0x00])).hex() == "f50a0015020000c319fa"
+
+
+def test_status_vibration_only_while_vibrating():
+    from walkingpad_controller.sperax import SperaxController
+
+    ctrl = SperaxController()
+    # Vibration mode (state byte at offset 4 = 0x50), level at offset 18 = 1.
+    vibrating = bytes([0x00, 0x19, 0, 0, 0x50, 0, 0, 0, 0x2f, 0, 3, 0, 2, 0, 0x44, 0, 0, 0, 1])
+    ctrl._parse_status(vibrating)
+    assert ctrl.status.vibration_level == 1
+    assert ctrl.status.speed == 0.0
+    # Vibration off: device returns to idle (state 0x00) but offset 18 still
+    # holds the stale last level (4) — must be reported as 0.
+    idle_stale = bytes([0x00, 0x19, 0, 0, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4])
+    ctrl._parse_status(idle_stale)
+    assert ctrl.status.vibration_level == 0
