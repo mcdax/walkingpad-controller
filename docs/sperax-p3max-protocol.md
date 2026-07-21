@@ -353,10 +353,10 @@ device streams `0x19` status notifications.
 - **Max speed is 12.0 km/h** (confirmed by the device owner in hass-walkingpad#3;
   the reference capture only reached 3.0 km/h). The `<speed>` byte still follows
   km/h × 10, so 12.0 km/h = `0x78`.
-- **Incline / decline** encoding beyond steps 0–2 is not yet captured. The P3 Max
-  advertises 15-level motorised incline *and* decline; a capture sweeping the full
-  incline range and into decline is needed to decode the `<incline>` byte (range and
-  how decline is represented — e.g. signed / offset).
+- **Incline is 0–10, no decline** (confirmed by a full incline-sweep capture in
+  hass-walkingpad#3). The `<incline>` byte in the run command and the incline field
+  in the status frame both range `0x00` (flat) .. `0x0A` (max); values never go
+  negative. The device does not expose a separate decline in the protocol.
 
 ---
 

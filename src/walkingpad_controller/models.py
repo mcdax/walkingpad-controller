@@ -57,6 +57,10 @@ class TreadmillStatus:
     """Vibration intensity level (0 = off, 1-4). Sperax / WLT6200 devices
     only; stays 0 for FTMS and WiLink."""
 
+    incline: int = 0
+    """Incline level (0 = flat .. 10 = max). Sperax / WLT6200 devices only;
+    stays 0 for FTMS and WiLink."""
+
     timestamp: float = field(default_factory=time.time)
     """Wall-clock time when this status was received."""
 

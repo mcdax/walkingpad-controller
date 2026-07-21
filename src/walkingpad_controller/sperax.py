@@ -144,7 +144,7 @@ _POLL_INTERVAL = 0.5
 _MIN_SPEED = 0.5
 _MAX_SPEED = 12.0
 _SPEED_INCREMENT = 0.1
-_MAX_INCLINE = 2
+_MAX_INCLINE = 10
 _MAX_VIBRATION = 4
 
 
@@ -346,6 +346,7 @@ class SperaxController:
 
         self._vibration_level = inner[18]
         self._status.vibration_level = inner[18]
+        self._status.incline = inner[16]
 
         # Best-effort counters — NOT yet unit-verified. Exposed so callers have
         # *something* trending; treat with caution until confirmed on hardware.
@@ -414,13 +415,20 @@ class SperaxController:
         return await self._send_run()
 
     async def set_target_inclination(self, incline_step: int) -> bool:
-        """Set the incline as a step (0-2).
+        """Set the incline as a step (0 = flat .. 10 = max).
 
         Unlike FTMS (which uses a percentage), the P3 Max exposes incline as
-        discrete steps. The value is clamped to 0..2.
+        discrete steps, clamped to 0..10.
+
+        Incline rides inside the run command (``15 01 <speed> <incline>``), so
+        applying it re-sends a run. We only do that while the belt is already
+        moving — sending it while stopped would start the belt. When stopped we
+        just cache the target; it is applied on the next start()/set_speed().
         """
         self._target_incline = max(0, min(_MAX_INCLINE, int(incline_step)))
-        return await self._send_run()
+        if self._status.speed > 0:
+            return await self._send_run()
+        return True
 
     async def set_vibration(self, level: int) -> bool:
         """Set the vibration level (0 = off, 1-4).
