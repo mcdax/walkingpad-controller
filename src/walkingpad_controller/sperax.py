@@ -148,6 +148,11 @@ _STATUS_STATE_VIBRATION = 0x50
 # the status fresh without hammering the write characteristic.
 _POLL_INTERVAL = 0.5
 
+# Consecutive failed poll writes tolerated before giving up the poll loop.
+# Absorbs the occasional dropped packet on a marginal BT-proxy link instead
+# of tearing down on the first hiccup.
+_MAX_POLL_FAILURES = 3
+
 # Speed capabilities. The P3 Max tops out at 12.0 km/h (confirmed by the
 # device owner in hass-walkingpad#3). The device is not known to expose a
 # readable speed-range characteristic, so these are fixed defaults.
@@ -295,14 +300,36 @@ class SperaxController:
             self._poll_task = None
 
     async def _poll_loop(self) -> None:
-        """Periodically poll the device so it keeps streaming status."""
+        """Periodically poll the device so it keeps streaming status.
+
+        A single failed poll write is tolerated: over an ESPHome BT proxy (or
+        any marginal link) the odd dropped packet is normal, and tearing the
+        loop down on the first error turns one hiccup into a full
+        disconnect/reconnect cycle. We only give up after
+        ``_MAX_POLL_FAILURES`` consecutive failures; a success resets the
+        counter. If the link is genuinely gone, ``self.connected`` goes false
+        and the loop exits on its own.
+        """
+        failures = 0
         try:
             while self.connected:
                 try:
                     await self._write(bytes([0x00, _CMD_STATUS]))
+                    failures = 0
                 except BleakError as err:
-                    _LOGGER.debug("Sperax: poll write failed: %s", err)
-                    break
+                    failures += 1
+                    _LOGGER.debug(
+                        "Sperax: poll write failed (%d/%d): %s",
+                        failures,
+                        _MAX_POLL_FAILURES,
+                        err,
+                    )
+                    if failures >= _MAX_POLL_FAILURES:
+                        _LOGGER.warning(
+                            "Sperax: stopping poll after %d consecutive failures",
+                            failures,
+                        )
+                        break
                 await asyncio.sleep(_POLL_INTERVAL)
         except asyncio.CancelledError:
             pass
