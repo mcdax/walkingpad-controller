@@ -130,6 +130,23 @@ def test_stop_resets_targets_pause_keeps_them():
     asyncio.run(run())
 
 
+def test_syncs_targets_from_device_on_first_status():
+    from walkingpad_controller.sperax import SperaxController
+
+    ctrl = SperaxController()
+    # First status frame after (re)connect: running at 3.0 km/h, incline 5.
+    frame = bytes([0x00, 0x19, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 30, 5, 0, 0])
+    ctrl._parse_status(frame)  # noqa: SLF001
+    # Targets adopted from the device rather than the min/flat defaults.
+    assert ctrl._target_speed_tenths == 30  # noqa: SLF001
+    assert ctrl._target_incline == 5  # noqa: SLF001
+    # A later frame does NOT re-seed (only the first one after connect does).
+    frame2 = bytes([0x00, 0x19, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 6, 0, 0])
+    ctrl._parse_status(frame2)  # noqa: SLF001
+    assert ctrl._target_speed_tenths == 30  # noqa: SLF001
+    assert ctrl._target_incline == 5  # noqa: SLF001
+
+
 def test_status_vibration_only_while_vibrating():
     from walkingpad_controller.sperax import SperaxController
 

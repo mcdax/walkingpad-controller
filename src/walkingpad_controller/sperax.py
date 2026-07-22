@@ -184,6 +184,14 @@ class SperaxController:
         self._target_incline = 0
         self._vibration_level = 0
 
+        # The device is the source of truth: on (re)connect we adopt its actual
+        # speed and incline from the first status frame, rather than assuming
+        # the defaults above. A new controller is created on every connect
+        # (including reconnect after a dropped link), so this re-syncs state
+        # each time and avoids, e.g., an incline nudge re-sending a stale
+        # minimum speed. Cleared on disconnect; set once per connection.
+        self._synced_from_device = False
+
         self._poll_task: asyncio.Task | None = None
 
     # --- Properties ---
@@ -287,6 +295,7 @@ class SperaxController:
     def _on_disconnect(self, client: BleakClient) -> None:
         _LOGGER.warning("Sperax: Device disconnected")
         self._connected = False
+        self._synced_from_device = False
         self._stop_poll()
         for cb in self._disconnect_callbacks:
             try:
@@ -390,6 +399,16 @@ class SperaxController:
         self._status.vibration_level = vib
         self._status.incline = inner[16]
 
+        # Adopt the device's actual speed/incline as our run targets on the
+        # first status frame after (re)connecting — the device is the source
+        # of truth. Without this, the freshly-created controller would keep its
+        # default targets (min speed, flat), so the next run command (e.g. from
+        # an incline nudge) would wrongly slow the belt to minimum.
+        if not self._synced_from_device:
+            self._target_speed_tenths = speed_raw
+            self._target_incline = inner[16]
+            self._synced_from_device = True
+
         # Best-effort counters — NOT yet unit-verified. Exposed so callers have
         # *something* trending; treat with caution until confirmed on hardware.
         # counter D (offset 14) trends fastest (~steps/distance).
@@ -404,6 +423,9 @@ class SperaxController:
 
     async def _send_run(self) -> bool:
         """(Re)send the current run target (speed + incline)."""
+        # We now have explicit intent; don't let a passive status frame
+        # overwrite these targets via the on-connect device sync.
+        self._synced_from_device = True
         speed = max(
             0,
             min(int(round(self._max_speed_tenths())), self._target_speed_tenths),
@@ -450,6 +472,7 @@ class SperaxController:
             await self._write(bytes([0x00, _CMD_RUN, _RUN_STATE_STOP, 0x00, 0x00]))
             self._target_speed_tenths = int(round(self.min_speed * 10))
             self._target_incline = 0
+            self._synced_from_device = True
             return True
         except BleakError as err:
             _LOGGER.warning("Sperax: stop failed: %s", err)
@@ -465,6 +488,7 @@ class SperaxController:
         """
         try:
             await self._write(bytes([0x00, _CMD_RUN, _RUN_STATE_PAUSE, 0x00, 0x00]))
+            self._synced_from_device = True
             return True
         except BleakError as err:
             _LOGGER.warning("Sperax: pause failed: %s", err)
@@ -488,6 +512,7 @@ class SperaxController:
         just cache the target; it is applied on the next start()/set_speed().
         """
         self._target_incline = max(0, min(_MAX_INCLINE, int(incline_step)))
+        self._synced_from_device = True
         if self._status.speed > 0:
             return await self._send_run()
         return True
