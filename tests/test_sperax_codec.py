@@ -95,6 +95,41 @@ def test_stop_and_pause_frames():
     assert encode(bytes([0x00, 0x15, 0x02, 0x00, 0x00])).hex() == "f50a0015020000c319fa"
 
 
+def test_stop_resets_targets_pause_keeps_them():
+    import asyncio
+
+    from walkingpad_controller.sperax import SperaxController
+
+    async def run():
+        ctrl = SperaxController()
+        sent = []
+
+        # Stub out the BLE write so we can drive the command methods offline.
+        async def awrite(inner):
+            sent.append(bytes(inner))
+
+        ctrl._write = awrite  # noqa: SLF001
+
+        # Simulate a run at 5.0 km/h, incline 3.
+        await ctrl.set_target_speed(5.0)
+        ctrl._status.speed = 5.0  # belt moving, so incline applies  # noqa: SLF001
+        await ctrl.set_target_inclination(3)
+        assert ctrl._target_speed_tenths == 50  # noqa: SLF001
+        assert ctrl._target_incline == 3  # noqa: SLF001
+
+        # Pause keeps the cached targets.
+        await ctrl.pause()
+        assert ctrl._target_speed_tenths == 50  # noqa: SLF001
+        assert ctrl._target_incline == 3  # noqa: SLF001
+
+        # Stop resets them to flat + minimum.
+        await ctrl.stop()
+        assert ctrl._target_incline == 0  # noqa: SLF001
+        assert ctrl._target_speed_tenths == int(round(ctrl.min_speed * 10))  # noqa: SLF001
+
+    asyncio.run(run())
+
+
 def test_status_vibration_only_while_vibrating():
     from walkingpad_controller.sperax import SperaxController
 

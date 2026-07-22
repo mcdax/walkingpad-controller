@@ -439,9 +439,17 @@ class SperaxController:
         session counters (steps / distance / time) to 0 — matching the FTMS
         backend's stop() semantics. Use pause() to stop the belt while keeping
         the running totals.
+
+        A stop is a full reset, so the cached run targets are cleared too: the
+        next start() begins flat (incline 0) and at the minimum speed rather
+        than resuming the previous run. (The incline byte in a *run* frame does
+        drive the bed, so the next start actually levels it — the stop frame
+        itself carries incline 0 but the device does not level from a stop.)
         """
         try:
             await self._write(bytes([0x00, _CMD_RUN, _RUN_STATE_STOP, 0x00, 0x00]))
+            self._target_speed_tenths = int(round(self.min_speed * 10))
+            self._target_incline = 0
             return True
         except BleakError as err:
             _LOGGER.warning("Sperax: stop failed: %s", err)
@@ -451,8 +459,9 @@ class SperaxController:
         """Pause the belt, keeping the session (``15 02 00 00``).
 
         The belt stops but the device preserves its session counters
-        (steps / distance / time), so a subsequent start() continues the
-        session — matching the FTMS backend's pause() semantics.
+        (steps / distance / time), and the cached run targets (speed + incline)
+        are left intact, so a subsequent start() resumes the previous run —
+        matching the FTMS backend's pause() semantics.
         """
         try:
             await self._write(bytes([0x00, _CMD_RUN, _RUN_STATE_PAUSE, 0x00, 0x00]))
