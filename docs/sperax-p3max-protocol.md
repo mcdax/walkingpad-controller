@@ -279,23 +279,24 @@ The core telemetry frame, streamed while polling. Inner body is fixed-layout
 | 2–3 | — | constant `00 00` in all samples |
 | **4** | **state** | `0x10` = running, `0x0F` = decelerating/stopping, `0x01` = stopped, `0x50` = vibration mode, `0x00` = idle/off |
 | 5–7 | — | constant `00 00 00` |
-| **8** | **counter A** | monotonic while active (slow); resets on idle — elapsed-time-like |
-| 9 | `0x00` | |
-| **10** | **counter B** | slow monotonic 16-bit (with offset 9) — distance/calorie-like |
-| 11 | `0x00` | |
-| **12** | **counter C** | slow monotonic 16-bit (with offset 11) |
-| 13 | `0x00` | |
-| **14** | **counter D** | faster monotonic (steps/distance-like); resets on idle |
+| **8–9** | **duration** | uint16 LE — elapsed seconds |
+| **10–11** | **distance** | uint16 LE in **10 m units** → metres = value × 10 |
+| **12–13** | calorie-like counter | uint16 LE; slow-moving. Left unmapped — the app's kcal is computed app-side and this field is only a coarse broadcast |
+| **14** | **steps** | uint8 (device-confirmed) |
 | **15** | **speed** | **current speed in km/h × 10** (`0x1E` = 3.0; ramps down during stop) |
-| **16** | **incline** | `0x00` / `0x01` / `0x02` |
+| **16** | **incline** | `0x00`–`0x0A` (0 = flat, 10 = max) |
 | 17 | `0x00` | |
-| **18** | **vibration level** | `0x00`–`0x04`; retains last level until reset |
+| **18** | **vibration level** | `0x00`–`0x04`; retains last level, only meaningful while state (4) is `0x50` |
 
-The **confirmed, directly usable** fields are **state (4)**, **speed (15)**,
-**incline (16)** and **vibration level (18)** — enough for Home Assistant sensors and
-state. Offsets 8/10/12/14 are cumulative counters (some combination of elapsed time,
-distance, steps and calories); separating them precisely needs a longer capture with
-known distance/time references.
+Field units for duration and distance were derived from a real walk: integrating
+speed over the session gives ~30 m and offset 10 reads `3` (× 10 = 30 m), while
+offset 8 tracks the elapsed-second count. Steps (offset 14) were confirmed on the
+physical console by the device owner (hass-walkingpad#3). The offset 12–13 counter
+moves too slowly to be distance and is most likely a coarse calorie estimate; it is
+left unmapped pending confirmation.
+
+> Note: steps (offset 14) is a single byte, so it wraps at 255 on this capture's
+> layout. Not yet observed on a longer walk — flagged for confirmation.
 
 **Worked examples** (inner body, spaces added):
 
@@ -351,8 +352,11 @@ device streams `0x19` status notifications.
 ## 7. Open items
 
 - Decode the hello-response (`0x01`) fields → device limits / units.
-- Separate status counters at offsets 8 / 10 / 12 / 14 (time vs distance vs steps vs
-  calories) with a longer, instrumented capture.
+- Status counters mostly resolved: offset 8–9 = duration (s), 10–11 = distance
+  (×10 m), 14 = steps. Offset 12–13 is an unmapped calorie-like counter — confirm
+  its unit (or that kcal is purely app-side) with a longer instrumented capture.
+- Confirm whether steps (offset 14) is really a single byte (wraps at 255) or has a
+  high byte elsewhere — needs a >255-step walk to observe.
 - **Max speed is 12.0 km/h** (confirmed by the device owner in hass-walkingpad#3;
   the reference capture only reached 3.0 km/h). The `<speed>` byte still follows
   km/h × 10, so 12.0 km/h = `0x78`.

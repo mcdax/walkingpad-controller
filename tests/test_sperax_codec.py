@@ -130,6 +130,20 @@ def test_stop_resets_targets_pause_keeps_them():
     asyncio.run(run())
 
 
+def test_status_parses_distance_and_duration():
+    from walkingpad_controller.sperax import SperaxController
+
+    ctrl = SperaxController()
+    # duration=47s (0x2f) at 8-9, distance=3 units (30 m) at 10-11, steps=68 at 14.
+    frame = bytes(
+        [0x00, 0x19, 0, 0, 0x10, 0, 0, 0, 0x2F, 0, 0x03, 0, 0x02, 0, 68, 30, 0, 0, 0]
+    )
+    ctrl._parse_status(frame)  # noqa: SLF001
+    assert ctrl.status.duration == 47
+    assert ctrl.status.distance == 30  # 3 * 10 m
+    assert ctrl.status.steps == 68
+
+
 def test_syncs_targets_from_device_on_first_status():
     from walkingpad_controller.sperax import SperaxController
 

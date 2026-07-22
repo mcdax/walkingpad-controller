@@ -371,14 +371,18 @@ class SperaxController:
         """Parse a 0x19 status body ``[0x00, 0x19, ...]`` into TreadmillStatus.
 
         Byte offsets within ``inner`` (see docs/sperax-p3max-protocol.md §5.2):
-          4  state (0x10 run, 0x0F decel, 0x01 stopped, 0x50 vibration, 0x00 idle)
-          8  counter A (elapsed-time-like)   14 counter D (steps/distance-like)
-          15 speed x10   16 incline   18 vibration level
+          4      state (0x10 run, 0x0F decel, 0x01 stopped, 0x50 vibration, 0x00 idle)
+          8-9    duration, seconds (uint16 LE)
+          10-11  distance, in 10 m units (uint16 LE) — so metres = value * 10
+          12-13  calorie-like counter (uint16 LE); left unmapped (the kcal the
+                 app shows is computed app-side and only coarsely broadcast)
+          14     steps (uint8)
+          15     speed x10   16 incline   18 vibration level
 
-        Only speed / belt-state / vibration are confidently decoded; the
-        cumulative counters are not yet separated (time vs distance vs steps
-        vs calories), so distance/duration/steps are left at their captured
-        raw counters as a best-effort and clearly flagged here.
+        Distance/duration decoded against a real walk: integrating speed over
+        the session gives ~30 m, and offset 10 reaches 3 (x10 = 30 m); offset 8
+        reaches the elapsed-second count. Steps were confirmed on-device by the
+        owner (hass-walkingpad#3).
         """
         if len(inner) < 19:
             return
@@ -409,12 +413,10 @@ class SperaxController:
             self._target_incline = inner[16]
             self._synced_from_device = True
 
-        # Best-effort counters — NOT yet unit-verified. Exposed so callers have
-        # *something* trending; treat with caution until confirmed on hardware.
-        # counter D (offset 14) trends fastest (~steps/distance).
+        # Session counters.
+        self._status.duration = inner[8] | (inner[9] << 8)  # seconds
+        self._status.distance = (inner[10] | (inner[11] << 8)) * 10  # metres (10 m units)
         self._status.steps = inner[14]
-        # counter A (offset 8) trends ~1/s (~elapsed seconds).
-        self._status.duration = inner[8]
 
         self._status.timestamp = time.time()
         self._notify_status()
