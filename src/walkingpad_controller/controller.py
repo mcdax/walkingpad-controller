@@ -214,9 +214,17 @@ class WalkingPadController:
     def _detect_protocol_from_name(self) -> ProtocolType | None:
         """Detect protocol from the BLE device name.
 
+        Prefers the live ``BLEDevice.name`` but falls back to the configured
+        name (``self._name``, e.g. the name stored by the Home Assistant config
+        entry). On a restart the BT proxy often hands over a ``BLEDevice`` with
+        no name yet; without this fallback the protocol would read UNKNOWN at
+        setup, hiding protocol-specific entities until the device is re-added.
+        The fallback resolves to the MAC address when no name exists, which
+        matches no prefix, so there is no risk of a false positive.
+
         Returns None if the name doesn't give a definitive answer.
         """
-        ble_name = self._ble_device.name or ""
+        ble_name = self._ble_device.name or self._name or ""
         for prefix in FTMS_NAME_PREFIXES:
             if ble_name.startswith(prefix):
                 _LOGGER.info(
