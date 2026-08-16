@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "walkingpad-controller"
-version = "0.4.11"
+version = "0.5.0"
 description = "Python library for controlling KingSmith WalkingPad treadmills over BLE (FTMS and legacy WiLink protocols)"
 readme = "README.md"
 license = "MIT"
@@ -44,3 +44,16 @@ Issues = "https://github.com/mcdax/walkingpad-controller/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/walkingpad_controller"]
+
+[tool.hatch.build.targets.sdist]
+# Whitelist what goes into the source distribution. Without this hatchling
+# sweeps in whatever sits in the working tree (captured APKs, tooling logs,
+# etc.), which bloated the sdist to hundreds of MB and would break the PyPI
+# upload. Keep it to the actual package plus docs/tests.
+include = [
+    "src/walkingpad_controller",
+    "tests",
+    "docs",
+    "README.md",
+    "LICENSE",
+]
