@@ -266,8 +266,12 @@ class TreadmillDataFlags:
 FTMS_NAME_PREFIXES = ("KS-HD-", "KS-MC21-", "KS-SMC21C-", "ZP-ZEALR1-")
 
 # BLE name prefixes for the Sperax / wi-linktech (WLT6200) vendor protocol.
-# The P3 Max advertises as "SPERAX_P3MAX".
-SPERAX_NAME_PREFIXES = ("SPERAX_",)
+# The P3 Max advertises as "SPERAX_P3MAX". Keep this specific rather than a
+# bare "SPERAX_" prefix: other Sperax-branded pads (e.g. the RM-01, which
+# advertises as "SPERAX_RM-01_...") speak FTMS, not the WLT6200 vendor
+# protocol. A too-broad prefix would misroute them to Sperax and break them;
+# names that don't match here fall through to service-probe detection.
+SPERAX_NAME_PREFIXES = ("SPERAX_P3MAX",)
 
 # Default connection parameters.
 # KingSmith FTMS firmware can be left in a bad state for several seconds
