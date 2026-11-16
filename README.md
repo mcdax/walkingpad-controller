@@ -133,8 +133,7 @@ For advanced use, you can use the protocol controllers directly:
 
 ### FTMS Protocol (tested)
 - KingSmith KS-Z1D (BLE name: `KS-HD-Z1D`) — confirmed working
-- KingSmith KS-Z1E (BLE name: `KS-HD-Z1E`) — plain FTMS verified by a community member using standalone macOS scripts (bleak/CoreBluetooth), not explicitly with this library; no vendor pre-amble or unlock frame needed.
-  Software `V0.0.9`, firmware `J41_V301.10.22`; advertised speed range 1.0–6.0 km/h, increment 0.1 km/h. See [model report #7](https://github.com/mcdax/walkingpad-controller/issues/7) and [protocol notes](https://github.com/pretidopenclaw-cmyk/tapis-marche/blob/main/docs/walkingpad-z1-protocol.md).
+- KingSmith KS-Z1E (BLE name: `KS-HD-Z1E`) — tested by community, see [#7](https://github.com/mcdax/walkingpad-controller/issues/7)
 - KingSmith MC-21 (BLE names: `KS-MC21-*`, `KS-SMC21C-*`, `ZP-ZEALR1-*`) — confirmed working as of v0.4.1, requires the vendor pre-amble described below
 - Other KingSmith devices with BLE names starting with `KS-HD-` are expected to work via the same FTMS / supplement-service code path
 
