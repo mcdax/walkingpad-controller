@@ -149,7 +149,17 @@ For advanced use, you can use the protocol controllers directly:
 KingSmith FTMS devices require a `START_OR_RESUME` command before the belt will accept speed commands. The library handles this automatically: it sends START, waits for the belt to report speed > 0 via treadmill data notifications, then waits an additional stabilization period before sending `SET_TARGET_SPEED`. This avoids the BLE disconnects that occur when speed commands are sent too early during motor startup.
 
 ### STOP While Running
-Some firmware (confirmed on the KingSmith R3) answers FTMS `STOP` with `OPERATION_FAILED` while the belt is moving, and the belt keeps running. KS Fit never does this: it pauses, then ends the session. `stop()` does the same: if the belt is moving it sends PAUSE, waits for the speed to reach 0, then sends STOP.
+The KingSmith R3 (`KS-AP-*`) answers FTMS `STOP` with `OPERATION_FAILED` while the belt is moving, and the belt keeps running. KS Fit never sends STOP to a moving belt: it pauses, then ends the session. For devices listed in `FTMS_PAUSE_BEFORE_STOP_PREFIXES` (currently only `KS-AP-`, verified on the R3), `stop()` does the same:
+
+1. It sends PAUSE whatever the cached speed is, because the cached value may be stale or lag a remote start.
+2. It waits for Treadmill Data received *after* the PAUSE to report 0 km/h.
+3. Only then does it send STOP.
+
+If the link drops, telemetry stops arriving, or the belt is still moving at the timeout, STOP is not sent, `stop()` returns `False`, and the log says which case it was. Other FTMS devices keep the plain STOP behaviour.
+
+The R3 also rejects both PAUSE and STOP during the 3-2-1 countdown after a START, and the belt then starts anyway. The firmware can't be halted during the countdown. If STOP is rejected at 0 km/h, `stop()` watches for the belt to start for a few seconds and pauses it as soon as it moves (on the R3 that takes about a second at 1 km/h). It then ends the session as above. If the belt stays at rest, there was no session to end and `stop()` returns `False`.
+
+Multi-step commands (`start`, `stop`, `set_target_speed`, …) are serialised within a controller, and so are Control Point acknowledgements. `pause()` only waits for an in-flight Control Point write, so it can still halt the belt while `start()` is waiting for it to move.
 
 ### BLE Connection Drops
 KingSmith FTMS devices may occasionally drop the connection after a cold start. The library stores the pending target speed and re-applies it after reconnection.

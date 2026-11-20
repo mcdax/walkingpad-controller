@@ -267,6 +267,15 @@ class TreadmillDataFlags:
 #                   supplement service; rejects STOP while the belt is moving.
 FTMS_NAME_PREFIXES = ("KS-HD-", "KS-MC21-", "KS-SMC21C-", "ZP-ZEALR1-", "KS-AP-")
 
+# FTMS devices whose firmware answers STOP with OPERATION_FAILED while the
+# belt is moving and keeps the belt running. On these, FTMSController.stop()
+# sends PAUSE first and only sends STOP once Treadmill Data received after
+# the PAUSE reports 0 km/h (what KS Fit does). Other FTMS devices keep the
+# plain STOP behaviour.
+#
+# Verified: KS-AP-RQ3 (KingSmith R3, model KS-R3Q, firmware V74.02.23).
+FTMS_PAUSE_BEFORE_STOP_PREFIXES = ("KS-AP-",)
+
 # BLE name prefixes for the Sperax / wi-linktech (WLT6200) vendor protocol.
 # The P3 Max advertises as "SPERAX_P3MAX". Keep this specific rather than a
 # bare "SPERAX_" prefix: other Sperax-branded pads (e.g. the RM-01, which
