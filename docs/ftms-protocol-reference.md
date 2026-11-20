@@ -161,6 +161,14 @@ Reconnect timing (from string analysis, not directly traced):
 - KS Fit waits for the first non-zero value in Treadmill Data's speed field before sending any speed target.
 - walkingpad-controller's `FTMSController._wait_for_belt_moving` implements the same gate.
 
+### 2.6.1 R3 (`KS-AP-*`) behaviour ✅
+
+- **STOP while the belt is moving is rejected**: `08 01` → `80 08 04 01` (OPERATION_FAILED), and the belt keeps running. KS Fit pauses (`08 02`), waits for 0 km/h, then sends `08 01`, which gets `80 08 01 01` and ends the session.
+- **CCCD writes are sometimes ignored right after connect.** No notifications arrived at all on ~2 of 6 connections. Verify that Treadmill Data is flowing and resubscribe if it isn't. KS Fit rewrites its CCCDs 3× after connecting, which may be the same workaround.
+- **Control Point indications are occasionally dropped** even when the command took effect: once, a STOP gave no `80 08 …` but the session still ended. Confirm via FM Status and Treadmill Data.
+- Unlike MC-21, the R3 sends a Control Point indication for **every** opcode. It needs no ODM pre-amble; `REQUEST_CONTROL` returns `80 00 01`.
+- **Distance, kcal and steps only accumulate while the foot sensor detects walking.** At 12 km/h with an empty belt, distance stays 0. Elapsed time always runs.
+
 ### 2.7 No explicit keepalive / ping
 
 🟡 No keepalive or heartbeat frame was observed in any of the four MC-21 captures. The connection stays alive purely on:
@@ -300,6 +308,71 @@ Decoded from `pp.txt` (line 56257+) via the `FTMSPropertyType` enum:
 ### 5.1 Frame structure
 
 🟠 `FTMSSupplement.wrapSupplementCmd` (line 1271 of `ftms_supplement.dart`) wraps a body with a header and checksum, similar in shape to ODM's wrapper. Frame is written to `…d00fdf7` (write characteristic) and the response comes back as a notification on `…b00fdf7`.
+
+✅ **On-wire format, decoded from a KingSmith R3** (`KS-AP-RQ3`, model `KS-R3Q`, FW V74.02.23). Sources: KS Fit iOS PacketLogger captures, plus direct probing; all of the frames below were seen on the wire:
+
+```
+[cmd] [flags] [len] [payload × len] [chk]       chk = sum(all preceding bytes) & 0xFF
+```
+
+| flags | meaning |
+|---|---|
+| `00` | request / command |
+| `01` | set |
+| `80` | response to `00` |
+| `81` | response to `01` |
+| `50` | unsolicited push |
+
+Quirks:
+- In `0x73` push frames the checksum **excludes the first byte**.
+- KS Fit sends get-properties as `72 00 00 00 72`, with one extra `00` that `len` doesn't count.
+- The ODM pre-amble (`01 00 0d 00 06 0b 0f 0d`, §4.2) does **not** fit this layout, so the two channels don't share a wrapper on the wire.
+
+| Frame (app → pad) | Reply | Meaning |
+|---|---|---|
+| `71 00 05 <token×5> <chk>` | `71 80 00 f1` | **Handshake / unlock** (likely `activeDevice` / `unlockCmd`). See §5.1.1. |
+| `71 01 08 <u32le unix time> 01 00 00 00 <chk>` | `71 81 09 03 00 00 00 1f 03 00 00 00 <chk>` | Clock sync. The time matched the capture time to the second. ❓ Meaning of the reply. |
+| `72 00 00 00 72` | `72 80 24 <36 bytes> <chk>` | Get property list: repeated `(u16le id, u16le value)` pairs. The ids are the `FTMSPropertyType` values from §4.4. |
+| `72 01 03 <id u8> <value u16le> <chk>` | `72 81 02 <id> <status>` | Set property. For id 7 the reply is always `07 07` and nothing changes (see below). |
+| — | `73 50 0d 00 <start u32le> 01 00 00 00 <end u32le \| 0> <chk>` | Session record, pushed at connect, on pause (end = 0) and on session end |
+
+R3 property values seen (`72 80` reply):
+
+| id | name | value | notes |
+|---|---|---|---|
+| 1 | `unit` | 0 | km/h |
+| 2 | `autoStop` | `0x403c` | ❓ |
+| 4 | `motorVersion` | 115 | |
+| 5 | `errCode` | 0 | |
+| 6 | `childLock` | 0 | |
+| 7 | `maxLimitSpeed` | **60 / 120** | km/h × 10 |
+| 8 | `otherSwitch` | `0x0f` | ❓ |
+| 9 | `readOnly` | **5 / 13** | |
+| 10 | `modeStatus` | `0x0300` / `0x0320` | ❓ |
+
+**Speed limit = handle position on the R3.**
+- With the handle down: `maxLimitSpeed`=60 (6.0 km/h), `readOnly`=5.
+- With the handle up: 120 (12.0 km/h) and 13. So `readOnly` bit `0x08` = handle up.
+- Writes to id 7 are refused (`07 07`). KS Fit itself sends `72 01 03 07 78 00` six times on start and gets the same refusal.
+- Target speeds above the limit are reported in FM Status `05`, but the belt stays at the limit.
+
+#### 5.1.1 Handshake gating ✅ (R3)
+
+**The pad silently ignores every Supplement frame**, including get-properties, until it receives a valid `71 00` handshake. The GATT writes are ACKed but produce no notification.
+
+| Token | Result |
+|---|---|
+| `87 b4 52 51 33`, `fa 27 53 51 33` (from two separate KS Fit connections) | accepted on any later connection |
+| `00 00 00 00 00` | ignored |
+| any single byte altered | ignored |
+
+So tokens carry an integrity check, but they aren't bound to a connection and don't expire.
+- ❓ How KS Fit derives the token.
+- ❓ Whether tokens are per-device.
+
+#### 5.1.2 Side effect: Treadmill Data cadence ✅ (R3)
+
+**Before** the handshake, Treadmill Data arrives at 1 Hz even when idle. **After** the handshake, it arrives only while the belt moves, plus a final 0 km/h frame. Idle gaps of 5–8 s were seen in both KS Fit and our own sessions. Don't use idle Treadmill Data as a link heartbeat after handshaking.
 
 ### 5.2 Method inventory
 
@@ -516,7 +589,7 @@ The hass-walkingpad manifest's `local_name` filter currently lists: `DYNAMAX*`, 
 
 These would benefit from either deeper disassembly reading or a Frida runtime trace against KS Fit:
 
-1. **Exact bytes of `wrapSupplementCmd` output for `propertyList()`** — I can read the body construction (`[0x20, 0, 0, 0]`) but not yet the exact wrapper that turns it into `01 00 0d 00 06 0b 0f 0d`.
+1. ~~**Exact bytes of `wrapSupplementCmd` output for `propertyList()`**~~ — **answered for the Supplement channel** (§5.1, from R3 captures): `72 00 00 00 72` → `72 80 <len> (u16 id, u16 value)…`. The ODM pre-amble still doesn't fit the same layout. — I can read the body construction (`[0x20, 0, 0, 0]`) but not yet the exact wrapper that turns it into `01 00 0d 00 06 0b 0f 0d`.
 2. **ODM response path** — what notification carries the device's reply to a `propertyList` request? None was clearly visible in the snoops.
 3. ~~**`field_43` characteristic binding**~~ — **answered.** `WilinkDevice._addAllNotifyAndRead` (line 10480) iterates the discovered characteristics and binds them to numbered fields by UUID match. The full binding table:
 
