@@ -111,7 +111,8 @@ def decode(frame: bytes) -> bytes | None:
     """
     if len(frame) < 6 or frame[0] != _SOF or frame[-1] != _EOF:
         return None
-    full = bytes([_SOF]) + _destuff(frame[1:-1]) + bytes([_EOF])
+    # LEN (frame[1]) is never stuffed; only the body is.
+    full = bytes([_SOF, frame[1]]) + _destuff(frame[2:-1]) + bytes([_EOF])
     if len(full) < 6:
         return None
     data = bytearray(full[:-3])
@@ -142,6 +143,8 @@ _VIB_STATE_OFF = 0x00
 # mode; the vibration-level field (offset 18) retains its last value even
 # after vibration is turned off, so it's only meaningful in this state.
 _STATUS_STATE_VIBRATION = 0x50
+_STATUS_STATE_RUNNING = 0x10
+_STATUS_STATE_IDLE = 0x00
 
 # How often to poll the device. The WLT6200 only streams status while it is
 # being polled; the official app polls ~3x/s. 0.5 s keeps the link alive and
@@ -193,6 +196,18 @@ class SperaxController:
         self._synced_from_device = False
 
         self._poll_task: asyncio.Task | None = None
+
+        # Last status-frame state byte (offset 4), or None right after a
+        # pause/stop until a fresh frame arrives. Incline changes are only
+        # sent while this says the belt is running.
+        self._device_state: int | None = None
+        # True after pause() until the next run/stop, so a belt at 0 km/h
+        # reads PAUSED rather than STOPPED (the state byte can't tell).
+        self._paused = False
+        # True once this controller chose the speed (start/set speed). Until
+        # then a running belt's speed (e.g. started from the remote) is
+        # adopted, so an incline change doesn't snap it to a stale target.
+        self._speed_from_us = False
 
     # --- Properties ---
 
@@ -269,18 +284,26 @@ class SperaxController:
         self._connected = True
         _LOGGER.info("Sperax: Connected to %s", ble_device.address)
 
-        # Subscribe to status notifications (0xFFF1) then say hello (0x01).
-        await self._client.start_notify(SPERAX_NOTIFY_UUID, self._on_notify)
-        await self._write(bytes([0x00, _CMD_HELLO]))
+        try:
+            # Subscribe to status notifications (0xFFF1) then say hello (0x01).
+            await self._client.start_notify(SPERAX_NOTIFY_UUID, self._on_notify)
+            await self._write(bytes([0x00, _CMD_HELLO]))
 
-        # The device only streams status while polled — start the keep-alive.
-        self._poll_task = asyncio.get_running_loop().create_task(self._poll_loop())
+            # The device only streams status while polled — start the keep-alive.
+            self._poll_task = asyncio.get_running_loop().create_task(self._poll_loop())
 
-        if not self.connected:
-            raise BleakError(
-                "Sperax: BLE link dropped during connection setup; treating "
-                "as a failed connect."
-            )
+            if not self.connected:
+                raise BleakError(
+                    "Sperax: BLE link dropped during connection setup; treating "
+                    "as a failed connect."
+                )
+        except BaseException:
+            # Don't leak a connected client when setup fails or is cancelled.
+            try:
+                await self.disconnect()
+            except Exception:
+                _LOGGER.debug("Sperax: Error closing link after failed setup")
+            raise
 
     async def disconnect(self) -> None:
         """Disconnect from the device."""
@@ -296,6 +319,7 @@ class SperaxController:
         _LOGGER.warning("Sperax: Device disconnected")
         self._connected = False
         self._synced_from_device = False
+        self._device_state = None
         self._stop_poll()
         for cb in self._disconnect_callbacks:
             try:
@@ -325,7 +349,7 @@ class SperaxController:
                 try:
                     await self._write(bytes([0x00, _CMD_STATUS]))
                     failures = 0
-                except BleakError as err:
+                except (BleakError, TimeoutError) as err:
                     failures += 1
                     _LOGGER.debug(
                         "Sperax: poll write failed (%d/%d): %s",
@@ -335,13 +359,40 @@ class SperaxController:
                     )
                     if failures >= _MAX_POLL_FAILURES:
                         _LOGGER.warning(
-                            "Sperax: stopping poll after %d consecutive failures",
+                            "Sperax: stopping poll after %d consecutive "
+                            "failures; dropping the link",
                             failures,
                         )
-                        break
+                        await self._give_up_link()
+                        return
                 await asyncio.sleep(_POLL_INTERVAL)
         except asyncio.CancelledError:
             pass
+
+    async def _give_up_link(self) -> None:
+        """Treat a link that no longer takes polls as disconnected.
+
+        The device only streams status while polled, so without the poll
+        loop the status would silently freeze while `connected` stays True.
+        Close the client and report the disconnect so callers reconnect.
+        """
+        self._poll_task = None  # we are that task; don't cancel ourselves
+        client = self._client
+        was_connected = self._connected
+        self._connected = False
+        self._synced_from_device = False
+        self._device_state = None
+        if client is not None and client.is_connected:
+            try:
+                await client.disconnect()
+            except (BleakError, TimeoutError):
+                pass
+        if was_connected:
+            for cb in self._disconnect_callbacks:
+                try:
+                    cb()
+                except Exception:
+                    _LOGGER.exception("Error in disconnect callback")
 
     # --- Write helper ---
 
@@ -388,11 +439,25 @@ class SperaxController:
             return
 
         speed_raw = inner[15]
+        self._device_state = inner[4]
         self._status.speed = speed_raw / 10.0
         if speed_raw > 0:
             self._status.belt_state = BeltState.ACTIVE
+        elif self._paused:
+            self._status.belt_state = BeltState.PAUSED
         else:
             self._status.belt_state = BeltState.STOPPED
+        if inner[4] == _STATUS_STATE_IDLE and not self._paused:
+            # No session: the next start() begins at the minimum speed
+            # instead of the previous session's target.
+            self._target_speed_tenths = int(round(self.min_speed * 10))
+            self._speed_from_us = False
+        elif (
+            inner[4] == _STATUS_STATE_RUNNING
+            and speed_raw > 0
+            and not self._speed_from_us
+        ):
+            self._target_speed_tenths = speed_raw
 
         # The vibration-level field (offset 18) holds the *last selected*
         # level and is not cleared when vibration turns off — the device
@@ -409,7 +474,10 @@ class SperaxController:
         # default targets (min speed, flat), so the next run command (e.g. from
         # an incline nudge) would wrongly slow the belt to minimum.
         if not self._synced_from_device:
-            self._target_speed_tenths = speed_raw
+            # A stopped belt reports 0 km/h; keep the minimum speed as the
+            # target then, or the next run command would stop the belt.
+            if speed_raw > 0:
+                self._target_speed_tenths = speed_raw
             self._target_incline = inner[16]
             self._synced_from_device = True
 
@@ -437,6 +505,7 @@ class SperaxController:
         )
         try:
             await self._write(inner)
+            self._paused = False
             return True
         except BleakError as err:
             _LOGGER.warning("Sperax: run command failed: %s", err)
@@ -454,6 +523,7 @@ class SperaxController:
         self._target_speed_tenths = max(
             int(round(self.min_speed * 10)), self._target_speed_tenths
         )
+        self._speed_from_us = True
         return await self._send_run()
 
     async def stop(self) -> bool:
@@ -475,6 +545,9 @@ class SperaxController:
             self._target_speed_tenths = int(round(self.min_speed * 10))
             self._target_incline = 0
             self._synced_from_device = True
+            self._paused = False
+            self._device_state = None
+            self._speed_from_us = False
             return True
         except BleakError as err:
             _LOGGER.warning("Sperax: stop failed: %s", err)
@@ -491,6 +564,8 @@ class SperaxController:
         try:
             await self._write(bytes([0x00, _CMD_RUN, _RUN_STATE_PAUSE, 0x00, 0x00]))
             self._synced_from_device = True
+            self._paused = True
+            self._device_state = None
             return True
         except BleakError as err:
             _LOGGER.warning("Sperax: pause failed: %s", err)
@@ -500,6 +575,7 @@ class SperaxController:
         """Set the belt speed in km/h."""
         speed_kmh = max(self.min_speed, min(self.max_speed, speed_kmh))
         self._target_speed_tenths = int(round(speed_kmh * 10))
+        self._speed_from_us = True
         return await self._send_run()
 
     async def set_target_inclination(self, incline_step: int) -> bool:
@@ -509,13 +585,14 @@ class SperaxController:
         discrete steps, clamped to 0..10.
 
         Incline rides inside the run command (``15 01 <speed> <incline>``), so
-        applying it re-sends a run. We only do that while the belt is already
-        moving — sending it while stopped would start the belt. When stopped we
-        just cache the target; it is applied on the next start()/set_speed().
+        applying it re-sends a run. We only do that while the device reports
+        the belt as running — sending it while stopped, paused or still
+        decelerating would (re)start the belt. Otherwise we just cache the
+        target; it is applied on the next start()/set_speed().
         """
         self._target_incline = max(0, min(_MAX_INCLINE, int(incline_step)))
         self._synced_from_device = True
-        if self._status.speed > 0:
+        if self._device_state == _STATUS_STATE_RUNNING and self._status.speed > 0:
             return await self._send_run()
         return True
 

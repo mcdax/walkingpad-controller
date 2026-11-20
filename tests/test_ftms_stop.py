@@ -18,6 +18,7 @@ import pytest
 
 from walkingpad_controller import FTMSController
 from walkingpad_controller.const import FTMSOpcode, FTMSStopPauseParam
+from walkingpad_controller.ftms import _CPResult
 
 PAUSE = (FTMSOpcode.STOP_OR_PAUSE, bytes([FTMSStopPauseParam.PAUSE]))
 STOP = (FTMSOpcode.STOP_OR_PAUSE, bytes([FTMSStopPauseParam.STOP]))
@@ -61,9 +62,15 @@ class Pad:
         self.session_end_on_stop = False
         self._frames_since_pause = 0
         self._tasks: list[asyncio.Task] = []
-        self.c._write_control_point = self._write  # type: ignore[method-assign]
+        self.c._write_control_point_result = self._write_result  # type: ignore[method-assign]
 
-    async def _write(self, opcode, params=b"", *args, **kwargs) -> bool:
+    async def _write_result(self, opcode, params=b"", *args, **kwargs) -> _CPResult:
+        result = await self._write(opcode, params)
+        if isinstance(result, _CPResult):
+            return result
+        return _CPResult.ACK if result else _CPResult.REJECTED
+
+    async def _write(self, opcode, params=b"", *args, **kwargs):
         cmd = (opcode, bytes(params))
         self.sent.append(cmd)
         self.speed_at_send.append(self.c._status.speed)

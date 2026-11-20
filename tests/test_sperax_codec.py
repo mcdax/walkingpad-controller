@@ -154,10 +154,12 @@ def test_syncs_targets_from_device_on_first_status():
     # Targets adopted from the device rather than the min/flat defaults.
     assert ctrl._target_speed_tenths == 30  # noqa: SLF001
     assert ctrl._target_incline == 5  # noqa: SLF001
-    # A later frame does NOT re-seed (only the first one after connect does).
+    # A later frame does NOT re-seed the incline (only the first one after
+    # connect does). The speed keeps following a running belt until this
+    # controller sets one itself (e.g. the remote changed it).
     frame2 = bytes([0x00, 0x19, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 6, 0, 0])
     ctrl._parse_status(frame2)  # noqa: SLF001
-    assert ctrl._target_speed_tenths == 30  # noqa: SLF001
+    assert ctrl._target_speed_tenths == 40  # noqa: SLF001
     assert ctrl._target_incline == 5  # noqa: SLF001
 
 

@@ -75,7 +75,7 @@ class BeltState(IntEnum):
 
 
 @unique
-class OperatingMode(Enum):
+class OperatingMode(IntEnum):
     """Treadmill operating modes."""
 
     AUTO = 0  # Belt starts/stops on foot detection

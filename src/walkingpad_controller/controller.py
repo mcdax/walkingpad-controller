@@ -297,8 +297,11 @@ class WalkingPadController:
             RuntimeError: If the protocol cannot be determined.
         """
         async with self._lock:
-            if self._connected:
+            if self.connected:
                 return
+            # The cached flag can be stale after a drop the backend didn't
+            # report; close any leftover backend before connecting again.
+            await self._close_backend()
 
             _LOGGER.info("Connecting to %s (%s)", self._name, self._ble_device.address)
 
@@ -324,16 +327,25 @@ class WalkingPadController:
             self._connected = True
             _LOGGER.info("Connected via %s protocol", self._protocol.value)
 
+    async def _close_backend(self) -> None:
+        """Disconnect and forget the current backend, if any."""
+        backend = self._ftms or self._wilink or self._sperax
+        self._ftms = self._wilink = self._sperax = None
+        self._connected = False
+        if backend is not None:
+            try:
+                await backend.disconnect()
+            except Exception:
+                _LOGGER.debug("Error closing previous backend", exc_info=True)
+
     async def _connect_ftms(self) -> None:
         """Connect using the FTMS protocol with retry logic."""
         last_error: Exception | None = None
         for attempt in range(1, MAX_CONNECT_RETRIES + 1):
+            ftms = FTMSController()
+            ftms.register_status_callback(self._on_status_update)
             try:
-                self._ftms = FTMSController()
-                self._ftms.register_status_callback(self._on_status_update)
-                self._ftms.register_disconnect_callback(self._on_disconnect)
-                await self._ftms.connect(self._ble_device, self._name)
-                return
+                await ftms.connect(self._ble_device, self._name)
             except (BleakError, TimeoutError) as err:
                 last_error = err
                 _LOGGER.warning(
@@ -344,6 +356,15 @@ class WalkingPadController:
                 )
                 if attempt < MAX_CONNECT_RETRIES:
                     await asyncio.sleep(RETRY_DELAY_SECONDS)
+                continue
+            # Register for disconnects only once this attempt succeeded, so
+            # a failed attempt's link can't report a disconnect later.
+            ftms.register_disconnect_callback(self._on_disconnect)
+            self._ftms = ftms
+            if not ftms.connected:
+                self._ftms = None
+                raise BleakError("FTMS: link dropped right after connecting")
+            return
         raise last_error  # type: ignore[misc]
 
     async def _connect_wilink(self) -> None:
@@ -361,12 +382,10 @@ class WalkingPadController:
 
         last_error: Exception | None = None
         for attempt in range(1, MAX_CONNECT_RETRIES + 1):
+            sperax = SperaxController()
+            sperax.register_status_callback(self._on_status_update)
             try:
-                self._sperax = SperaxController()
-                self._sperax.register_status_callback(self._on_status_update)
-                self._sperax.register_disconnect_callback(self._on_disconnect)
-                await self._sperax.connect(self._ble_device)
-                return
+                await sperax.connect(self._ble_device)
             except (BleakError, TimeoutError) as err:
                 last_error = err
                 _LOGGER.warning(
@@ -377,6 +396,13 @@ class WalkingPadController:
                 )
                 if attempt < MAX_CONNECT_RETRIES:
                     await asyncio.sleep(RETRY_DELAY_SECONDS)
+                continue
+            sperax.register_disconnect_callback(self._on_disconnect)
+            self._sperax = sperax
+            if not sperax.connected:
+                self._sperax = None
+                raise BleakError("Sperax: link dropped right after connecting")
+            return
         raise last_error  # type: ignore[misc]
 
     async def disconnect(self) -> None:
@@ -494,7 +520,8 @@ class WalkingPadController:
 
         If the belt is already running, sends SET_TARGET_SPEED directly.
         If the belt is stopped, starts it first (the belt will run at
-        minimum speed until the user adjusts the speed slider).
+        minimum speed until the user adjusts the speed slider). A speed of
+        0 or less pauses a running belt and leaves a stopped one alone.
 
         Args:
             speed_kmh: Target speed in km/h.
@@ -502,9 +529,17 @@ class WalkingPadController:
         Returns:
             True if the command was sent successfully.
         """
+        if speed_kmh <= 0:
+            # 0 km/h means "halt", not "minimum speed" — and must never
+            # start a stopped belt.
+            if self.status.speed > 0:
+                return await self.pause()
+            return True
+
         if self._ftms:
-            if self._ftms.status.speed > 0:
-                # Belt already running — safe to send speed directly
+            if self._ftms.status.speed > 0 and not self._ftms._paused:
+                # Belt already running — safe to send speed directly. A belt
+                # still decelerating after PAUSE takes the start path below.
                 return await self._ftms.set_target_speed(speed_kmh)
             else:
                 # Belt is stopped — start it first, then send the requested

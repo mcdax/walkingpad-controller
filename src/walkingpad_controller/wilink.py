@@ -171,6 +171,14 @@ class WiLinkController:
 
     # --- Commands ---
 
+    def _speed_tenths(self, speed_kmh: float) -> int:
+        """Clamp to the supported range and convert to 0.1 km/h units.
+
+        Rounds instead of truncating: ``int(0.8 * 10)`` is 7 in floating point.
+        """
+        speed_kmh = max(self.min_speed, min(self.max_speed, speed_kmh))
+        return int(round(speed_kmh * 10))
+
     async def start(self, target_speed: float | None = None) -> bool:
         """Start the treadmill belt.
 
@@ -184,7 +192,7 @@ class WiLinkController:
         try:
             await self._controller.start_belt()
             if target_speed is not None:
-                speed_tenths = int(target_speed * 10)
+                speed_tenths = self._speed_tenths(target_speed)
                 await self._controller.change_speed(speed_tenths)
             return True
         except Exception as err:
@@ -210,7 +218,7 @@ class WiLinkController:
             True if the command was sent successfully.
         """
         try:
-            speed_tenths = int(speed_kmh * 10)
+            speed_tenths = self._speed_tenths(speed_kmh)
             await self._controller.change_speed(speed_tenths)
             return True
         except Exception as err:

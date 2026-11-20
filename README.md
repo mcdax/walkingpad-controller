@@ -157,7 +157,7 @@ The KingSmith R3 (`KS-AP-*`) answers FTMS `STOP` with `OPERATION_FAILED` while t
 
 If the link drops, telemetry stops arriving, or the belt is still moving at the timeout, STOP is not sent, `stop()` returns `False`, and the log says which case it was. Other FTMS devices keep the plain STOP behaviour.
 
-The R3 also rejects both PAUSE and STOP during the 3-2-1 countdown after a START, and the belt then starts anyway. The firmware can't be halted during the countdown. If STOP is rejected at 0 km/h, `stop()` watches for the belt to start for a few seconds and pauses it as soon as it moves (on the R3 that takes about a second at 1 km/h). It then ends the session as above. If the belt stays at rest, there was no session to end and `stop()` returns `False`. If the controller saw the last session end on this connection and no start since, it skips that watch and returns `False` straight away.
+The R3 also rejects both PAUSE and STOP during the 3-2-1 countdown after a START, and the belt then starts anyway. The firmware can't be halted during the countdown. If STOP is rejected at 0 km/h, `stop()` watches for the belt to start for a few seconds and pauses it as soon as it moves (on the R3 that takes about a second at 1 km/h). It then ends the session as above. If the belt stays at rest, there was no session to end and `stop()` returns `False`.
 
 Multi-step commands (`start`, `stop`, `set_target_speed`, …) are serialised within a controller, and so are Control Point acknowledgements. `pause()` only waits for an in-flight Control Point write, so it can still halt the belt while `start()` is waiting for it to move.
 
