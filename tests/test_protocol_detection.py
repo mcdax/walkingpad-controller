@@ -27,6 +27,7 @@ def _controller(name: str) -> WalkingPadController:
         ("KS-MC21-D06BFD", ProtocolType.FTMS),
         ("KS-SMC21C-XXXX", ProtocolType.FTMS),
         ("ZP-ZEALR1-XXXX", ProtocolType.FTMS),
+        ("KS-AP-RQ3", ProtocolType.FTMS),
         # The P3 Max is the only Sperax vendor-protocol device.
         ("SPERAX_P3MAX", ProtocolType.SPERAX),
         # Sperax-branded but FTMS: must fall through to service probing,

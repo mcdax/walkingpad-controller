@@ -100,3 +100,10 @@ class DeviceCapabilities:
 
     firmware_version: str = ""
     """Firmware version reported by the Software Revision String (0x2A28)."""
+
+    pause_before_stop: bool = False
+    """Whether STOP must be preceded by PAUSE and a confirmed standstill.
+
+    Set from the BLE name (``FTMS_PAUSE_BEFORE_STOP_PREFIXES``) for firmware
+    that rejects STOP while the belt is moving.
+    """

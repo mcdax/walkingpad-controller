@@ -134,6 +134,7 @@ For advanced use, you can use the protocol controllers directly:
 ### FTMS Protocol (tested)
 - KingSmith KS-Z1D (BLE name: `KS-HD-Z1D`) — confirmed working
 - KingSmith KS-Z1E (BLE name: `KS-HD-Z1E`) — tested by community, see [#7](https://github.com/mcdax/walkingpad-controller/issues/7)
+- KingSmith R3 (BLE name: `KS-AP-RQ3`, model `KS-R3Q`) — tested: connect, start, set_speed, pause, stop. Rejects STOP while the belt moves, so `stop()` pauses first (see Known Behavior)
 - KingSmith MC-21 (BLE names: `KS-MC21-*`, `KS-SMC21C-*`, `ZP-ZEALR1-*`) — confirmed working as of v0.4.1, requires the vendor pre-amble described below
 - Other KingSmith devices with BLE names starting with `KS-HD-` are expected to work via the same FTMS / supplement-service code path
 
@@ -146,6 +147,19 @@ For advanced use, you can use the protocol controllers directly:
 
 ### FTMS Cold Start
 KingSmith FTMS devices require a `START_OR_RESUME` command before the belt will accept speed commands. The library handles this automatically: it sends START, waits for the belt to report speed > 0 via treadmill data notifications, then waits an additional stabilization period before sending `SET_TARGET_SPEED`. This avoids the BLE disconnects that occur when speed commands are sent too early during motor startup.
+
+### STOP While Running
+The KingSmith R3 (`KS-AP-*`) answers FTMS `STOP` with `OPERATION_FAILED` while the belt is moving, and the belt keeps running. KS Fit never sends STOP to a moving belt: it pauses, then ends the session. For devices listed in `FTMS_PAUSE_BEFORE_STOP_PREFIXES` (currently only `KS-AP-`, verified on the R3), `stop()` does the same:
+
+1. It sends PAUSE whatever the cached speed is, because the cached value may be stale or lag a remote start.
+2. It waits for Treadmill Data received *after* the PAUSE to report 0 km/h.
+3. Only then does it send STOP.
+
+If the link drops, telemetry stops arriving, or the belt is still moving at the timeout, STOP is not sent, `stop()` returns `False`, and the log says which case it was. Other FTMS devices keep the plain STOP behaviour.
+
+The R3 also rejects both PAUSE and STOP during the 3-2-1 countdown after a START, and the belt then starts anyway. The firmware can't be halted during the countdown. If STOP is rejected at 0 km/h, `stop()` watches for the belt to start for a few seconds and pauses it as soon as it moves (on the R3 that takes about a second at 1 km/h). It then ends the session as above. If the belt stays at rest, there was no session to end and `stop()` returns `False`.
+
+Multi-step commands (`start`, `stop`, `set_target_speed`, …) are serialised within a controller, and so are Control Point acknowledgements. `pause()` only waits for an in-flight Control Point write, so it can still halt the belt while `start()` is waiting for it to move.
 
 ### BLE Connection Drops
 KingSmith FTMS devices may occasionally drop the connection after a cold start. The library stores the pending target speed and re-applies it after reconnection.

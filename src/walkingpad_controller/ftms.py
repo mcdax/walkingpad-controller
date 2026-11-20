@@ -23,6 +23,7 @@ Protocol reference:
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
 import struct
 import time
@@ -37,6 +38,7 @@ from .const import (
     FITNESS_MACHINE_STATUS_UUID,
     FTMS_CONTROL_POINT_UUID,
     FTMS_FEATURE_UUID,
+    FTMS_PAUSE_BEFORE_STOP_PREFIXES,
     KINGSMITH_VENDOR_PREAMBLE_PAYLOAD,
     KINGSMITH_VENDOR_PREAMBLE_UUID,
     SOFTWARE_REVISION_UUID,
@@ -65,6 +67,15 @@ _CP_TO_STATUS_ACK: dict[int, int] = {
     FTMSOpcode.SET_TARGET_SPEED: FitnessMachineStatusOpcode.TARGET_SPEED_CHANGED,
     FTMSOpcode.SET_TARGET_INCLINATION: FitnessMachineStatusOpcode.TARGET_INCLINATION_CHANGED,
 }
+
+
+class _Standstill(enum.Enum):
+    """Outcome of waiting for the belt to come to rest."""
+
+    CONFIRMED = "confirmed"
+    STILL_MOVING = "still_moving"
+    NO_TELEMETRY = "no_telemetry"
+    DISCONNECTED = "disconnected"
 
 
 class FTMSController:
@@ -107,6 +118,33 @@ class FTMSController:
         # default STOPPED — so HA can distinguish "session paused, will
         # resume" from "session ended, counters reset on next start".
         self._paused: bool = False
+
+        # Serialises multi-step operations (start / stop / set speed /
+        # inclination / reset) so e.g. a SET_TARGET_SPEED can't land between
+        # stop()'s PAUSE and STOP. pause() deliberately does not take it: it
+        # is the halt path and must never queue behind a multi-step
+        # operation that is waiting on the belt.
+        self._op_lock = asyncio.Lock()
+        # Serialises Control Point write-and-wait, which shares a single
+        # response slot (`_cp_response_event` / `_cp_response_data`).
+        self._cp_lock = asyncio.Lock()
+
+        # Treadmill Data bookkeeping for standstill confirmation: a counter
+        # bumped on every frame plus an event to wake waiters. Speed in
+        # `_status` can be stale (e.g. carried over from before a
+        # reconnect); only frames counted after a command prove anything.
+        self._treadmill_data_seq = 0
+        self._treadmill_data_event = asyncio.Event()
+        # Count of FM Status STOPPED_OR_PAUSED + STOP events (session end).
+        self._session_end_events = 0
+        # How long stop() waits for the belt to come to rest after PAUSE.
+        self._standstill_timeout = 15.0
+        # How many PAUSE -> standstill -> STOP cycles stop() tries on
+        # pause-before-stop devices before giving up.
+        self._stop_attempts = 2
+        # After STOP is rejected at 0 km/h, how long stop() watches for the
+        # belt to start (R3 start countdown is ~4 s; see stop()).
+        self._countdown_grace = 6.0
 
     @property
     def connected(self) -> bool:
@@ -195,6 +233,13 @@ class FTMSController:
 
         _LOGGER.info("FTMS: Connected to %s", ble_device.address)
 
+        name = (ble_device.name or "").upper()
+        self._capabilities.pause_before_stop = name.startswith(
+            FTMS_PAUSE_BEFORE_STOP_PREFIXES
+        )
+        if self._capabilities.pause_before_stop:
+            _LOGGER.info("FTMS: %s needs PAUSE before STOP", ble_device.name)
+
         # Discover services so we can detect supplement / vendor pre-amble
         # characteristics. Local (BlueZ-cached) — no extra GATT round-trips.
         await self._discover_services()
@@ -253,6 +298,9 @@ class FTMSController:
         # Re-arm the first-event skip so the next connection's stale
         # 2ADA replay is also dropped.
         self._machine_status_first_event_skipped = False
+        # Wake anything waiting on telemetry so it sees the disconnect
+        # instead of sitting out its timeout.
+        self._treadmill_data_event.set()
         for cb in self._disconnect_callbacks:
             try:
                 cb()
@@ -418,6 +466,8 @@ class FTMSController:
         # Instantaneous Speed - always present (UINT16, 0.01 km/h)
         speed_raw = struct.unpack_from("<H", data, offset)[0]
         self._status.speed = speed_raw / 100.0
+        self._treadmill_data_seq += 1
+        self._treadmill_data_event.set()
         # Belt state derivation:
         #   speed > 0           -> ACTIVE
         #   speed = 0 + paused  -> PAUSED (session alive, awaiting resume)
@@ -594,6 +644,7 @@ class FTMSController:
                 if data[1] == FTMSStopPauseParam.STOP:
                     _LOGGER.info("FTMS: Treadmill stopped by user")
                     self._paused = False
+                    self._session_end_events += 1
                     # Treadmill Data with speed=0 will follow shortly and
                     # set belt_state = STOPPED via the speed-0 + ~paused
                     # branch; no need to write it here.
@@ -667,8 +718,18 @@ class FTMSController:
     ) -> bool:
         """Write a command to the FTMS Control Point and wait for response.
 
+        Writes are serialised: the response slot is shared, so a second
+        command must not clear or consume the first one's acknowledgement.
+
         Returns True if the command was acknowledged with success.
         """
+        async with self._cp_lock:
+            return await self._write_control_point_locked(opcode, params, timeout)
+
+    async def _write_control_point_locked(
+        self, opcode: FTMSOpcode, params: bytes, timeout: float
+    ) -> bool:
+        """Body of `_write_control_point`; caller holds `_cp_lock`."""
         if not self._client or not self._client.is_connected:
             _LOGGER.warning("FTMS: Not connected, cannot send command")
             return False
@@ -811,6 +872,10 @@ class FTMSController:
         Returns:
             True if the belt is running. False if the connection was lost.
         """
+        async with self._op_lock:
+            return await self._start_locked()
+
+    async def _start_locked(self) -> bool:
         if not self._has_control:
             await self._request_control()
 
@@ -889,16 +954,175 @@ class FTMSController:
         return False
 
     async def stop(self) -> bool:
-        """Stop the treadmill."""
-        if not self._has_control:
-            await self._request_control()
-        return await self._write_control_point(
+        """Stop the treadmill — end the session.
+
+        On most FTMS devices this sends STOP directly. Devices listed in
+        ``FTMS_PAUSE_BEFORE_STOP_PREFIXES`` (the KingSmith R3) answer STOP
+        with OPERATION_FAILED while the belt is moving and keep it running.
+        For those, mirror KS Fit: send PAUSE, wait for Treadmill Data
+        received *after* the PAUSE to report 0 km/h, then send STOP. The
+        cached speed is never trusted for this decision; it may be stale or
+        lag a physical/remote start.
+
+        Returns:
+            True if the session was ended. False if STOP was rejected or
+            not sent because standstill could not be confirmed (in that
+            case the belt has been asked to pause, but its state may be
+            unknown — see the log).
+        """
+        async with self._op_lock:
+            if not self._has_control:
+                await self._request_control()
+            if not self._capabilities.pause_before_stop:
+                return await self._send_stop()
+
+            for attempt in range(1, self._stop_attempts + 1):
+                if not await self._pause_until_standstill():
+                    return False
+                seq = self._treadmill_data_seq
+                if await self._send_stop():
+                    return True
+                if not self.connected:
+                    _LOGGER.warning("FTMS: connection lost while sending STOP")
+                    return False
+                # The R3 rejects both PAUSE and STOP at 0 km/h in two
+                # states: no session at all, and the 3-2-1 countdown after
+                # a START (from us, the remote or the app). In the
+                # countdown case the belt starts a moment later anyway and
+                # cannot be halted before it does, so watch for motion and
+                # pause it as soon as it moves.
+                if attempt == self._stop_attempts:
+                    break
+                outcome = await self._wait_for_motion(seq, self._countdown_grace)
+                if outcome is _Standstill.DISCONNECTED:
+                    _LOGGER.warning(
+                        "FTMS: connection lost after STOP was rejected; belt "
+                        "state unknown"
+                    )
+                    return False
+                if outcome is not _Standstill.STILL_MOVING:
+                    _LOGGER.warning(
+                        "FTMS: STOP rejected and the belt stayed at rest "
+                        "(no active session?)"
+                    )
+                    return False
+                _LOGGER.warning(
+                    "FTMS: belt started after STOP was rejected (start "
+                    "countdown); pausing it (attempt %d/%d)",
+                    attempt + 1,
+                    self._stop_attempts,
+                )
+            _LOGGER.warning("FTMS: STOP rejected; session not ended")
+            return False
+
+    async def _send_stop(self) -> bool:
+        """Send STOP; also accept the FM Status session-end event as success.
+
+        The R3 occasionally drops the Control Point indication even though
+        the command took effect, while still emitting FM Status ``02 01``.
+        """
+        ends_before = self._session_end_events
+        if await self._write_control_point(
             FTMSOpcode.STOP_OR_PAUSE,
             bytes([FTMSStopPauseParam.STOP]),
-        )
+        ):
+            return True
+        if self._session_end_events != ends_before:
+            _LOGGER.info(
+                "FTMS: STOP not acknowledged on the Control Point, but FM "
+                "Status reported the session ended"
+            )
+            return True
+        return False
+
+    async def _pause_until_standstill(self) -> bool:
+        """Send PAUSE and wait for fresh telemetry to confirm 0 km/h.
+
+        PAUSE is sent regardless of the cached speed. A rejected or
+        unacknowledged PAUSE is not fatal on its own (the belt may already
+        be paused, or the indication was dropped): the decision rests on
+        Treadmill Data received after the PAUSE.
+        """
+        seq = self._treadmill_data_seq
+        if not await self._write_control_point(
+            FTMSOpcode.STOP_OR_PAUSE,
+            bytes([FTMSStopPauseParam.PAUSE]),
+        ):
+            _LOGGER.info(
+                "FTMS: PAUSE not acknowledged; checking telemetry before STOP"
+            )
+        outcome = await self._wait_for_standstill(seq, self._standstill_timeout)
+        if outcome is _Standstill.CONFIRMED:
+            return True
+        if outcome is _Standstill.DISCONNECTED:
+            _LOGGER.warning(
+                "FTMS: connection lost while waiting for the belt to stop "
+                "after PAUSE; belt state unknown, STOP not sent"
+            )
+        elif outcome is _Standstill.NO_TELEMETRY:
+            _LOGGER.warning(
+                "FTMS: no Treadmill Data within %.0fs of PAUSE; belt state "
+                "unknown, STOP not sent",
+                self._standstill_timeout,
+            )
+        else:
+            _LOGGER.warning(
+                "FTMS: belt still reports %.1f km/h %.0fs after PAUSE; STOP "
+                "not sent",
+                self._status.speed,
+                self._standstill_timeout,
+            )
+        return False
+
+    async def _wait_for_motion(self, after_seq: int, timeout: float) -> _Standstill:
+        """Wait for a Treadmill Data frame newer than ``after_seq`` with speed > 0.
+
+        Returns STILL_MOVING if the belt moved, CONFIRMED if it stayed at
+        rest until the timeout, or DISCONNECTED.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            if not self.connected:
+                return _Standstill.DISCONNECTED
+            if self._treadmill_data_seq > after_seq and self._status.speed > 0:
+                return _Standstill.STILL_MOVING
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return _Standstill.CONFIRMED
+            self._treadmill_data_event.clear()
+            try:
+                await asyncio.wait_for(self._treadmill_data_event.wait(), remaining)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _wait_for_standstill(self, after_seq: int, timeout: float) -> _Standstill:
+        """Wait for a Treadmill Data frame newer than ``after_seq`` with speed 0."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            if not self.connected:
+                return _Standstill.DISCONNECTED
+            if self._treadmill_data_seq > after_seq and self._status.speed == 0:
+                return _Standstill.CONFIRMED
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                if self._treadmill_data_seq == after_seq:
+                    return _Standstill.NO_TELEMETRY
+                return _Standstill.STILL_MOVING
+            self._treadmill_data_event.clear()
+            try:
+                await asyncio.wait_for(self._treadmill_data_event.wait(), remaining)
+            except asyncio.TimeoutError:
+                pass
 
     async def pause(self) -> bool:
-        """Pause the treadmill."""
+        """Pause the treadmill.
+
+        Not serialised behind other operations (only behind other Control
+        Point writes), so it can halt the belt while e.g. start() is still
+        waiting for the belt to move.
+        """
         if not self._has_control:
             await self._request_control()
         return await self._write_control_point(
@@ -908,9 +1132,10 @@ class FTMSController:
 
     async def reset(self) -> bool:
         """Reset the fitness machine."""
-        if not self._has_control:
-            await self._request_control()
-        return await self._write_control_point(FTMSOpcode.RESET)
+        async with self._op_lock:
+            if not self._has_control:
+                await self._request_control()
+            return await self._write_control_point(FTMSOpcode.RESET)
 
     async def set_target_speed(self, speed_kmh: float) -> bool:
         """Set the target speed in km/h.
@@ -938,13 +1163,16 @@ class FTMSController:
         speed_raw = int(round(speed_kmh * 100))
         params = struct.pack("<H", speed_raw)
 
-        if not self._has_control:
-            await self._request_control()
+        async with self._op_lock:
+            if not self._has_control:
+                await self._request_control()
 
-        _LOGGER.debug(
-            "FTMS: Setting target speed to %.2f km/h (raw: %d)", speed_kmh, speed_raw
-        )
-        return await self._write_control_point(FTMSOpcode.SET_TARGET_SPEED, params)
+            _LOGGER.debug(
+                "FTMS: Setting target speed to %.2f km/h (raw: %d)",
+                speed_kmh,
+                speed_raw,
+            )
+            return await self._write_control_point(FTMSOpcode.SET_TARGET_SPEED, params)
 
     async def set_target_inclination(self, inclination_pct: float) -> bool:
         """Set the target inclination in percent.
@@ -958,9 +1186,10 @@ class FTMSController:
         inclination_raw = int(round(inclination_pct * 10))
         params = struct.pack("<h", inclination_raw)
 
-        if not self._has_control:
-            await self._request_control()
+        async with self._op_lock:
+            if not self._has_control:
+                await self._request_control()
 
-        return await self._write_control_point(
-            FTMSOpcode.SET_TARGET_INCLINATION, params
-        )
+            return await self._write_control_point(
+                FTMSOpcode.SET_TARGET_INCLINATION, params
+            )

@@ -439,6 +439,9 @@ class WalkingPadController:
         """Stop the treadmill — full session end. Counters reset.
 
         On FTMS this sends `STOP_OR_PAUSE` with the STOP parameter (0x01).
+        On devices that reject STOP while the belt moves (KingSmith R3,
+        `KS-AP-*`) it pauses first and sends STOP only once fresh telemetry
+        confirms 0 km/h.
         For most user-facing UIs you probably want `pause()` instead — that
         matches the phone-app and physical-remote behaviour where pressing
         the stop button leaves the session live and resumable.
