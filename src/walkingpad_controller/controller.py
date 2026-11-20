@@ -332,7 +332,7 @@ class WalkingPadController:
                 self._ftms = FTMSController()
                 self._ftms.register_status_callback(self._on_status_update)
                 self._ftms.register_disconnect_callback(self._on_disconnect)
-                await self._ftms.connect(self._ble_device)
+                await self._ftms.connect(self._ble_device, self._name)
                 return
             except (BleakError, TimeoutError) as err:
                 last_error = err

@@ -48,6 +48,7 @@ class Pad:
         self.c._status.speed = speed
         self.c._standstill_timeout = 0.3
         self.c._countdown_grace = 0.3
+        self.c._start_rejected_grace = 0.3
         self.sent: list[tuple[int, bytes]] = []
         # speed in _status at the moment each command was written, and how
         # many frames had been delivered since the last PAUSE
@@ -92,11 +93,11 @@ class Pad:
         self.c._client.is_connected = False  # type: ignore[union-attr]
         self.c._on_disconnect(None)  # type: ignore[arg-type]
 
-    def stop(self) -> bool:
+    def stop(self, *, first_status_event_seen: bool = True) -> bool:
         async def run() -> bool:
-            # mark the first FM Status event as already seen so the
-            # simulated session-end event isn't dropped as a stale replay
-            self.c._machine_status_first_event_skipped = True
+            # by default, mark the first FM Status event as already seen so
+            # the simulated events take the normal path
+            self.c._machine_status_first_event_skipped = first_status_event_seen
             try:
                 return await self.c.stop()
             finally:
