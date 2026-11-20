@@ -134,6 +134,7 @@ For advanced use, you can use the protocol controllers directly:
 ### FTMS Protocol (tested)
 - KingSmith KS-Z1D (BLE name: `KS-HD-Z1D`) — confirmed working
 - KingSmith KS-Z1E (BLE name: `KS-HD-Z1E`) — tested by community, see [#7](https://github.com/mcdax/walkingpad-controller/issues/7)
+- KingSmith R3 (BLE name: `KS-AP-RQ3`, model `KS-R3Q`) — tested: connect, start, set_speed, pause, stop. Rejects STOP while the belt moves, so `stop()` pauses first (see Known Behavior)
 - KingSmith MC-21 (BLE names: `KS-MC21-*`, `KS-SMC21C-*`, `ZP-ZEALR1-*`) — confirmed working as of v0.4.1, requires the vendor pre-amble described below
 - Other KingSmith devices with BLE names starting with `KS-HD-` are expected to work via the same FTMS / supplement-service code path
 
@@ -146,6 +147,9 @@ For advanced use, you can use the protocol controllers directly:
 
 ### FTMS Cold Start
 KingSmith FTMS devices require a `START_OR_RESUME` command before the belt will accept speed commands. The library handles this automatically: it sends START, waits for the belt to report speed > 0 via treadmill data notifications, then waits an additional stabilization period before sending `SET_TARGET_SPEED`. This avoids the BLE disconnects that occur when speed commands are sent too early during motor startup.
+
+### STOP While Running
+Some firmware (confirmed on the KingSmith R3) answers FTMS `STOP` with `OPERATION_FAILED` while the belt is moving, and the belt keeps running. KS Fit never does this: it pauses, then ends the session. `stop()` does the same: if the belt is moving it sends PAUSE, waits for the speed to reach 0, then sends STOP.
 
 ### BLE Connection Drops
 KingSmith FTMS devices may occasionally drop the connection after a cold start. The library stores the pending target speed and re-applies it after reconnection.

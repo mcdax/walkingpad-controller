@@ -263,7 +263,9 @@ class TreadmillDataFlags:
 # - KS-SMC21C-*   : "C" variant of the MC-21 family.
 # - ZP-ZEALR1-*   : Zeal-branded OEM variant of the MC-21 (KS Fit's isMC21
 #                   getter matches all three).
-FTMS_NAME_PREFIXES = ("KS-HD-", "KS-MC21-", "KS-SMC21C-", "ZP-ZEALR1-")
+# - KS-AP-*       : KingSmith R3 (e.g. KS-AP-RQ3, model KS-R3Q). FTMS plus the
+#                   supplement service; rejects STOP while the belt is moving.
+FTMS_NAME_PREFIXES = ("KS-HD-", "KS-MC21-", "KS-SMC21C-", "ZP-ZEALR1-", "KS-AP-")
 
 # BLE name prefixes for the Sperax / wi-linktech (WLT6200) vendor protocol.
 # The P3 Max advertises as "SPERAX_P3MAX". Keep this specific rather than a

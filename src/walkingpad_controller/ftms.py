@@ -889,13 +889,37 @@ class FTMSController:
         return False
 
     async def stop(self) -> bool:
-        """Stop the treadmill."""
+        """Stop the treadmill — end the session.
+
+        Some KingSmith firmware rejects STOP with OPERATION_FAILED while the
+        belt is moving and keeps the belt running (confirmed on the KingSmith
+        R3, BLE name ``KS-AP-RQ3``). KS Fit never sends STOP to a moving
+        belt: it pauses first and ends the session once the belt is at rest.
+        Mirror that so stop() reliably halts the belt on every model.
+        """
         if not self._has_control:
             await self._request_control()
+        if self._status.speed > 0:
+            if not await self.pause():
+                return False
+            if not await self._wait_for_belt_stopped():
+                _LOGGER.warning("FTMS: belt still moving after PAUSE; not sending STOP")
+                return False
         return await self._write_control_point(
             FTMSOpcode.STOP_OR_PAUSE,
             bytes([FTMSStopPauseParam.STOP]),
         )
+
+    async def _wait_for_belt_stopped(self, timeout: float = 15.0) -> bool:
+        """Wait for treadmill data to report speed 0 (belt ramps down over a few seconds)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not self.connected:
+                return False
+            if self._status.speed == 0:
+                return True
+            await asyncio.sleep(0.5)
+        return False
 
     async def pause(self) -> bool:
         """Pause the treadmill."""
