@@ -174,7 +174,8 @@ class WiLinkController:
     def _speed_tenths(self, speed_kmh: float) -> int:
         """Clamp to the supported range and convert to 0.1 km/h units.
 
-        Rounds instead of truncating: ``int(0.8 * 10)`` is 7 in floating point.
+        Rounds instead of truncating: ``int((0.6 + 0.3) * 10)`` is 8, not 9,
+        in floating point.
         """
         speed_kmh = max(self.min_speed, min(self.max_speed, speed_kmh))
         return int(round(speed_kmh * 10))

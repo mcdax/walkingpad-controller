@@ -78,7 +78,7 @@ def test_connect_uses_the_fallback_name_for_the_quirk(
 
 def test_session_end_counts_even_as_first_status_event_after_connect() -> None:
     pad = Pad(pause_before_stop=True)
-    pad.results[STOP] = [False]
+    pad.results[STOP] = [_CPResult.TIMEOUT]  # type: ignore[list-item]
     pad.session_end_on_stop = True
     assert pad.stop(first_status_event_seen=False) is True
     assert pad.sent == [PAUSE, STOP]
@@ -706,3 +706,42 @@ def test_r3_with_flowing_telemetry_does_not_resubscribe(monkeypatch) -> None:
 
     asyncio.run(run())
     assert calls == {"subscribe": 1, "stop": 0}
+
+
+def test_explicitly_rejected_stop_is_not_overridden_by_a_status_event() -> None:
+    pad = Pad(pause_before_stop=False)
+    pad.results[STOP] = [False]  # OPERATION_FAILED indication
+    pad.session_end_on_stop = True
+    assert pad.stop() is False
+
+
+def test_late_indication_does_not_overwrite_the_pending_slot() -> None:
+    c = FTMSController()
+    c._cp_pending_opcode = FTMSOpcode.SET_TARGET_SPEED
+    c._on_control_point_response(0, bytearray([0x80, 0x02, 0x01]))  # own ack
+    c._on_control_point_response(0, bytearray([0x80, 0x00, 0x01]))  # late REQUEST_CONTROL
+    assert c._cp_response_data == bytes([0x80, 0x02, 0x01])
+
+
+def test_disconnect_from_a_retired_client_is_ignored() -> None:
+    pad = Pad(pause_before_stop=False)
+    lost: list[bool] = []
+    pad.c.register_disconnect_callback(lambda: lost.append(True))
+    pad.c._on_disconnect(SimpleNamespace())  # type: ignore[arg-type]
+    assert pad.c.connected and lost == []
+
+
+def test_replay_during_the_cccd_write_is_still_dropped(monkeypatch) -> None:
+    from walkingpad_controller import ftms
+    from walkingpad_controller.const import FITNESS_MACHINE_STATUS_UUID
+
+    monkeypatch.setattr(ftms.asyncio, "sleep", _no_sleep)
+    c = FTMSController()
+
+    async def start_notify(uuid, handler):
+        if uuid == FITNESS_MACHINE_STATUS_UUID:
+            handler(0, bytearray([0x02, 0x02]))  # replay while subscribing
+
+    c._client = SimpleNamespace(is_connected=True, start_notify=start_notify)  # type: ignore[assignment]
+    asyncio.run(c._subscribe_notifications())
+    assert c._paused is False

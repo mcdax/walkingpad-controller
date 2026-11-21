@@ -320,6 +320,8 @@ class SperaxController:
         self._connected = False
 
     def _on_disconnect(self, client: BleakClient) -> None:
+        if client is not None and client is not self._client:
+            return  # a retired client from an earlier connection
         _LOGGER.warning("Sperax: Device disconnected")
         self._connected = False
         self._synced_from_device = False
@@ -553,6 +555,9 @@ class SperaxController:
         drive the bed, so the next start actually levels it — the stop frame
         itself carries incline 0 but the device does not level from a stop.)
         """
+        # Invalidate "running" before the write: an incline change racing
+        # this stop must not send a RUN that restarts the belt.
+        self._device_state = None
         try:
             await self._write(bytes([0x00, _CMD_RUN, _RUN_STATE_STOP, 0x00, 0x00]))
             self._target_speed_tenths = int(round(self.min_speed * 10))
@@ -574,13 +579,17 @@ class SperaxController:
         are left intact, so a subsequent start() resumes the previous run —
         matching the FTMS backend's pause() semantics.
         """
+        was_running = (
+            self._status.speed > 0 or self._device_state == _STATUS_STATE_RUNNING
+        )
+        # As in stop(): no RUN from a racing incline change after this point.
+        self._device_state = None
         try:
             await self._write(bytes([0x00, _CMD_RUN, _RUN_STATE_PAUSE, 0x00, 0x00]))
             self._synced_from_device = True
-            # Pausing an idle belt doesn't create a paused session.
-            self._paused = (
-                self._status.speed > 0 or self._device_state == _STATUS_STATE_RUNNING
-            )
+            # Pausing an idle belt doesn't create a paused session; pausing
+            # again keeps an existing one.
+            self._paused = self._paused or was_running
             self._device_state = None
             return True
         except BleakError as err:

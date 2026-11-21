@@ -158,3 +158,35 @@ def test_poll_give_up_and_bleak_callback_report_once(monkeypatch) -> None:
     ctrl.register_disconnect_callback(lambda: lost.append(True))
     asyncio.run(asyncio.wait_for(ctrl._poll_loop(), 1.0))
     assert lost == [True]
+
+
+def test_pausing_twice_keeps_the_paused_session() -> None:
+    ctrl = SperaxController()
+    offline(ctrl)
+    ctrl._parse_status(status(30))
+    asyncio.run(ctrl.pause())
+    ctrl._parse_status(status(0, state=0x01))
+    asyncio.run(ctrl.pause())  # e.g. speed slider moved to 0 again
+    ctrl._parse_status(status(0, state=0x01))
+    assert ctrl.status.belt_state == BeltState.PAUSED
+
+
+def test_incline_during_the_pause_write_does_not_restart_the_belt() -> None:
+    ctrl = SperaxController()
+    sent: list[bytes] = []
+    ctrl._parse_status(status(30))
+
+    async def slow_write(inner):
+        await asyncio.sleep(0.05)
+        sent.append(bytes(inner))
+
+    ctrl._write = slow_write  # type: ignore[method-assign]
+
+    async def run() -> None:
+        pause = asyncio.create_task(ctrl.pause())
+        await asyncio.sleep(0.01)  # pause write in flight
+        await ctrl.set_target_inclination(4)
+        await pause
+
+    asyncio.run(run())
+    assert [s[2] for s in sent] == [0x02]

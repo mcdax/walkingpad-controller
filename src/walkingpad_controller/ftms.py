@@ -115,6 +115,8 @@ class FTMSController:
         # Control point indication response
         self._cp_response_event = asyncio.Event()
         self._cp_response_data: bytes = b""
+        # Opcode of the Control Point write in flight, if any.
+        self._cp_pending_opcode: int | None = None
 
         # KingSmith firmware fires its current state on the 0x2ADA char as
         # soon as the CCCD is enabled — typically a stale STOPPED_OR_PAUSED
@@ -357,6 +359,8 @@ class FTMSController:
 
     def _on_disconnect(self, client: BleakClient) -> None:
         """Handle disconnection."""
+        if client is not None and client is not self._client:
+            return  # a retired client from an earlier connection
         _LOGGER.warning("FTMS: Device disconnected")
         self._reset_link_state()
         for cb in self._disconnect_callbacks:
@@ -536,9 +540,11 @@ class FTMSController:
 
         for uuid, handler, label, delay_after, required in subscriptions:
             try:
-                await self._client.start_notify(uuid, handler)
+                # Stamp before the CCCD write: the replay can be dispatched
+                # while start_notify is still awaiting.
                 if uuid == FITNESS_MACHINE_STATUS_UUID:
                     self._status_subscribed_at = time.monotonic()
+                await self._client.start_notify(uuid, handler)
                 _LOGGER.debug("FTMS: Subscribed to %s", label)
             except Exception as err:
                 if required:
@@ -894,6 +900,16 @@ class FTMSController:
         Response format: [0x80, request_opcode, result_code, ...]
         """
         _LOGGER.debug("FTMS: Control Point response: %s", data.hex())
+        if (
+            self._cp_pending_opcode is not None
+            and len(data) >= 2
+            and data[0] == FTMSOpcode.RESPONSE_CODE
+            and data[1] != self._cp_pending_opcode
+        ):
+            # Late indication for an earlier command: don't let it overwrite
+            # the slot the current command is waiting on.
+            _LOGGER.debug("FTMS: Ignoring indication for opcode 0x%02x", data[1])
+            return
         self._cp_response_data = bytes(data)
         self._cp_response_event.set()
 
@@ -928,6 +944,7 @@ class FTMSController:
                 # Always clear the expectation, also on error or cancellation.
                 self._status_ack_expected_opcode = None
                 self._status_ack_expected_param = None
+                self._cp_pending_opcode = None
 
     async def _write_and_wait(
         self, opcode: FTMSOpcode, params: bytes, timeout: float
@@ -971,6 +988,10 @@ class FTMSController:
         _LOGGER.debug("FTMS: Sending control point command: %s", command.hex())
 
         self._cp_response_event.clear()
+        # Known protocol limit: an indication carries only the request
+        # opcode, so a late ack of an earlier command with the same opcode
+        # (PAUSE vs STOP) cannot be told apart from this command's ack.
+        self._cp_pending_opcode = opcode
 
         try:
             await client.write_gatt_char(
@@ -1276,7 +1297,9 @@ class FTMSController:
                 )
             except asyncio.TimeoutError:
                 pass
-        if self._session_end_events != ends_before:
+        # Only a missing ack is overridden by FM Status; an explicit
+        # rejection stands.
+        if result is _CPResult.TIMEOUT and self._session_end_events != ends_before:
             _LOGGER.info(
                 "FTMS: STOP not acknowledged on the Control Point, but FM "
                 "Status reported the session ended"

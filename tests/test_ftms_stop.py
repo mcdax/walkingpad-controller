@@ -263,7 +263,7 @@ def test_disconnect_while_watching_for_countdown_start(caplog) -> None:
 
 def test_dropped_stop_indication_but_session_end_event_counts() -> None:
     pad = Pad(pause_before_stop=True)
-    pad.results[STOP] = [False]
+    pad.results[STOP] = [_CPResult.TIMEOUT]  # type: ignore[list-item]
     pad.session_end_on_stop = True
     assert pad.stop() is True
     assert pad.sent == [PAUSE, STOP]
