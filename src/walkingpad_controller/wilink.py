@@ -3,8 +3,8 @@
 This module wraps the ph4_walkingpad.pad.Controller to provide the same
 interface as FTMSController, using the unified TreadmillStatus model.
 
-The ph4-walkingpad package is an optional dependency. If not installed,
-importing this module will raise ImportError.
+The ph4-walkingpad package is an optional dependency. If it is not
+installed, creating a WiLinkController raises ImportError.
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ from typing import Callable
 
 from bleak.backends.device import BLEDevice
 
+from ._callbacks import fire_callbacks
+from .const import BeltState
 from .models import TreadmillStatus
 
 _LOGGER = logging.getLogger(__name__)
@@ -94,8 +96,6 @@ class WiLinkController:
 
     def _on_status_update(self, sender, data) -> None:
         """Handle status update from ph4_walkingpad Controller."""
-        from .const import BeltState, OperatingMode
-
         belt_state = (
             data.belt_state
             if data.belt_state in (e.value for e in BeltState)
@@ -115,11 +115,9 @@ class WiLinkController:
             timestamp=time.time(),
         )
 
-        for cb in self._status_callbacks:
-            try:
-                cb(self._status)
-            except Exception:
-                _LOGGER.exception("Error in status callback")
+        fire_callbacks(
+            self._status_callbacks, _LOGGER, "Error in status callback", self._status
+        )
 
     # --- Connection ---
 
@@ -143,8 +141,8 @@ class WiLinkController:
             try:
                 client.set_disconnected_callback(self._on_ble_disconnect)
             except (AttributeError, NotImplementedError):
-                # Bleak removed set_disconnected_callback in a future
-                # release; fall through and rely on `connected` polling.
+                # This client has no (working) set_disconnected_callback;
+                # fall through and rely on `connected` polling.
                 _LOGGER.debug(
                     "WiLink: Bleak set_disconnected_callback unavailable; "
                     "disconnect events will only surface via connected polls"
@@ -154,11 +152,7 @@ class WiLinkController:
         """Handle BLE disconnect from the underlying ph4 BleakClient."""
         _LOGGER.warning("WiLink: BLE link dropped")
         self._connected = False
-        for cb in self._disconnect_callbacks:
-            try:
-                cb()
-            except Exception:
-                _LOGGER.exception("Error in disconnect callback")
+        fire_callbacks(self._disconnect_callbacks, _LOGGER, "Error in disconnect callback")
 
     async def disconnect(self) -> None:
         """Disconnect from the device."""
@@ -170,6 +164,15 @@ class WiLinkController:
             self._connected = False
 
     # --- Commands ---
+
+    def _speed_tenths(self, speed_kmh: float) -> int:
+        """Clamp to the supported range and convert to 0.1 km/h units.
+
+        Rounds instead of truncating: ``int((0.6 + 0.3) * 10)`` is 8, not 9,
+        in floating point.
+        """
+        speed_kmh = max(self.min_speed, min(self.max_speed, speed_kmh))
+        return int(round(speed_kmh * 10))
 
     async def start(self, target_speed: float | None = None) -> bool:
         """Start the treadmill belt.
@@ -184,7 +187,7 @@ class WiLinkController:
         try:
             await self._controller.start_belt()
             if target_speed is not None:
-                speed_tenths = int(target_speed * 10)
+                speed_tenths = self._speed_tenths(target_speed)
                 await self._controller.change_speed(speed_tenths)
             return True
         except Exception as err:
@@ -210,7 +213,7 @@ class WiLinkController:
             True if the command was sent successfully.
         """
         try:
-            speed_tenths = int(speed_kmh * 10)
+            speed_tenths = self._speed_tenths(speed_kmh)
             await self._controller.change_speed(speed_tenths)
             return True
         except Exception as err:

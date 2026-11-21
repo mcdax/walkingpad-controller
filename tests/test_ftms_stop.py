@@ -18,6 +18,7 @@ import pytest
 
 from walkingpad_controller import FTMSController
 from walkingpad_controller.const import FTMSOpcode, FTMSStopPauseParam
+from walkingpad_controller.ftms import _CPResult
 
 PAUSE = (FTMSOpcode.STOP_OR_PAUSE, bytes([FTMSStopPauseParam.PAUSE]))
 STOP = (FTMSOpcode.STOP_OR_PAUSE, bytes([FTMSStopPauseParam.STOP]))
@@ -48,6 +49,7 @@ class Pad:
         self.c._status.speed = speed
         self.c._standstill_timeout = 0.3
         self.c._countdown_grace = 0.3
+        self.c._start_rejected_grace = 0.3
         self.sent: list[tuple[int, bytes]] = []
         # speed in _status at the moment each command was written, and how
         # many frames had been delivered since the last PAUSE
@@ -60,9 +62,15 @@ class Pad:
         self.session_end_on_stop = False
         self._frames_since_pause = 0
         self._tasks: list[asyncio.Task] = []
-        self.c._write_control_point = self._write  # type: ignore[method-assign]
+        self.c._write_control_point_result = self._write_result  # type: ignore[method-assign]
 
-    async def _write(self, opcode, params=b"", *args, **kwargs) -> bool:
+    async def _write_result(self, opcode, params=b"", *args, **kwargs) -> _CPResult:
+        result = await self._write(opcode, params)
+        if isinstance(result, _CPResult):
+            return result
+        return _CPResult.ACK if result else _CPResult.REJECTED
+
+    async def _write(self, opcode, params=b"", *args, **kwargs):
         cmd = (opcode, bytes(params))
         self.sent.append(cmd)
         self.speed_at_send.append(self.c._status.speed)
@@ -92,11 +100,11 @@ class Pad:
         self.c._client.is_connected = False  # type: ignore[union-attr]
         self.c._on_disconnect(None)  # type: ignore[arg-type]
 
-    def stop(self) -> bool:
+    def stop(self, *, first_status_event_seen: bool = True) -> bool:
         async def run() -> bool:
-            # mark the first FM Status event as already seen so the
-            # simulated session-end event isn't dropped as a stale replay
-            self.c._machine_status_first_event_skipped = True
+            # by default, mark the first FM Status event as already seen so
+            # the simulated events take the normal path
+            self.c._machine_status_first_event_seen = first_status_event_seen
             try:
                 return await self.c.stop()
             finally:
@@ -255,7 +263,7 @@ def test_disconnect_while_watching_for_countdown_start(caplog) -> None:
 
 def test_dropped_stop_indication_but_session_end_event_counts() -> None:
     pad = Pad(pause_before_stop=True)
-    pad.results[STOP] = [False]
+    pad.results[STOP] = [_CPResult.TIMEOUT]  # type: ignore[list-item]
     pad.session_end_on_stop = True
     assert pad.stop() is True
     assert pad.sent == [PAUSE, STOP]

@@ -42,10 +42,12 @@ from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 from bleak_retry_connector import establish_connection
 
+from ._callbacks import fire_callbacks
 from .const import (
     SPERAX_NOTIFY_UUID,
     SPERAX_WRITE_UUID,
     BeltState,
+    OperatingMode,
 )
 from .models import DeviceCapabilities, SpeedRange, TreadmillStatus
 
@@ -111,7 +113,8 @@ def decode(frame: bytes) -> bytes | None:
     """
     if len(frame) < 6 or frame[0] != _SOF or frame[-1] != _EOF:
         return None
-    full = bytes([_SOF]) + _destuff(frame[1:-1]) + bytes([_EOF])
+    # LEN (frame[1]) is never stuffed; only the body is.
+    full = bytes([_SOF, frame[1]]) + _destuff(frame[2:-1]) + bytes([_EOF])
     if len(full) < 6:
         return None
     data = bytearray(full[:-3])
@@ -129,7 +132,7 @@ _CMD_VIBRATION = 0x16
 _CMD_STATUS = 0x19
 _CMD_ACK = 0xD0
 
-# Run-command state byte (2nd arg of 0x15). Confirmed in hass-walkingpad#3:
+# Run-command state byte (first argument after opcode 0x15). Confirmed in hass-walkingpad#3:
 #   0x01 = run, 0x02 = pause (belt stops, session counters kept),
 #   0x00 = stop (belt stops AND steps/distance/time reset to 0).
 _RUN_STATE_RUN = 0x01
@@ -142,6 +145,20 @@ _VIB_STATE_OFF = 0x00
 # mode; the vibration-level field (offset 18) retains its last value even
 # after vibration is turned off, so it's only meaningful in this state.
 _STATUS_STATE_VIBRATION = 0x50
+_STATUS_STATE_RUNNING = 0x10
+_STATUS_STATE_IDLE = 0x00
+
+# Byte offsets within a decoded 0x19 status body ``[0x00, 0x19, ...]``
+# (not on-wire frame offsets); see `_parse_status`.
+_STATUS_MIN_LEN = 19
+_STATUS_OFF_STATE = 4
+_STATUS_OFF_DURATION = 8  # uint16 LE, seconds
+_STATUS_OFF_DISTANCE = 10  # uint16 LE, 10 m units
+_STATUS_OFF_STEPS = 14
+_STATUS_OFF_SPEED = 15  # km/h x10
+_STATUS_OFF_INCLINE = 16
+_STATUS_OFF_VIBRATION = 18
+_DISTANCE_UNIT_M = 10
 
 # How often to poll the device. The WLT6200 only streams status while it is
 # being polled; the official app polls ~3x/s. 0.5 s keeps the link alive and
@@ -193,6 +210,21 @@ class SperaxController:
         self._synced_from_device = False
 
         self._poll_task: asyncio.Task | None = None
+
+        # Last status-frame state byte (offset 4), or None right after a
+        # pause/stop until a fresh frame arrives. Incline changes are only
+        # sent while this says the belt is running.
+        self._device_state: int | None = None
+        # True after pause() until the next run/stop, so a belt at 0 km/h
+        # reads PAUSED rather than STOPPED (the state byte can't tell).
+        self._paused = False
+        # True once this controller chose the speed (start/set speed). Until
+        # then a running belt's speed (e.g. started from the remote) is
+        # adopted, so an incline change doesn't snap it to a stale target.
+        self._speed_from_us = False
+        # Set once the disconnect callbacks fired for the current link, so a
+        # poll give-up and Bleak's own callback don't both report it.
+        self._disconnect_reported = False
 
     # --- Properties ---
 
@@ -249,11 +281,9 @@ class SperaxController:
         self._disconnect_callbacks.append(callback)
 
     def _notify_status(self) -> None:
-        for cb in self._status_callbacks:
-            try:
-                cb(self._status)
-            except Exception:
-                _LOGGER.exception("Error in status callback")
+        fire_callbacks(
+            self._status_callbacks, _LOGGER, "Error in status callback", self._status
+        )
 
     # --- Connection ---
 
@@ -267,20 +297,29 @@ class SperaxController:
             disconnected_callback=self._on_disconnect,
         )
         self._connected = True
+        self._disconnect_reported = False
         _LOGGER.info("Sperax: Connected to %s", ble_device.address)
 
-        # Subscribe to status notifications (0xFFF1) then say hello (0x01).
-        await self._client.start_notify(SPERAX_NOTIFY_UUID, self._on_notify)
-        await self._write(bytes([0x00, _CMD_HELLO]))
+        try:
+            # Subscribe to status notifications (0xFFF1) then say hello (0x01).
+            await self._client.start_notify(SPERAX_NOTIFY_UUID, self._on_notify)
+            await self._write(bytes([0x00, _CMD_HELLO]))
 
-        # The device only streams status while polled — start the keep-alive.
-        self._poll_task = asyncio.get_running_loop().create_task(self._poll_loop())
+            # The device only streams status while polled — start the keep-alive.
+            self._poll_task = asyncio.get_running_loop().create_task(self._poll_loop())
 
-        if not self.connected:
-            raise BleakError(
-                "Sperax: BLE link dropped during connection setup; treating "
-                "as a failed connect."
-            )
+            if not self.connected:
+                raise BleakError(
+                    "Sperax: BLE link dropped during connection setup; treating "
+                    "as a failed connect."
+                )
+        except BaseException:
+            # Don't leak a connected client when setup fails or is cancelled.
+            try:
+                await self.disconnect()
+            except Exception:
+                _LOGGER.debug("Sperax: Error closing link after failed setup")
+            raise
 
     async def disconnect(self) -> None:
         """Disconnect from the device."""
@@ -293,15 +332,25 @@ class SperaxController:
         self._connected = False
 
     def _on_disconnect(self, client: BleakClient) -> None:
+        if client is not None and client is not self._client:
+            return  # a retired client from an earlier connection
         _LOGGER.warning("Sperax: Device disconnected")
+        self._mark_link_down()
+        self._stop_poll()
+        self._report_disconnect()
+
+    def _mark_link_down(self) -> None:
+        """Forget per-link state once the link is gone."""
         self._connected = False
         self._synced_from_device = False
-        self._stop_poll()
-        for cb in self._disconnect_callbacks:
-            try:
-                cb()
-            except Exception:
-                _LOGGER.exception("Error in disconnect callback")
+        self._device_state = None
+
+    def _report_disconnect(self) -> None:
+        """Fire the disconnect callbacks once per connection."""
+        if self._disconnect_reported:
+            return
+        self._disconnect_reported = True
+        fire_callbacks(self._disconnect_callbacks, _LOGGER, "Error in disconnect callback")
 
     def _stop_poll(self) -> None:
         if self._poll_task is not None:
@@ -325,7 +374,7 @@ class SperaxController:
                 try:
                     await self._write(bytes([0x00, _CMD_STATUS]))
                     failures = 0
-                except BleakError as err:
+                except (BleakError, TimeoutError) as err:
                     failures += 1
                     _LOGGER.debug(
                         "Sperax: poll write failed (%d/%d): %s",
@@ -335,13 +384,34 @@ class SperaxController:
                     )
                     if failures >= _MAX_POLL_FAILURES:
                         _LOGGER.warning(
-                            "Sperax: stopping poll after %d consecutive failures",
+                            "Sperax: stopping poll after %d consecutive "
+                            "failures; dropping the link",
                             failures,
                         )
-                        break
+                        await self._give_up_link()
+                        return
                 await asyncio.sleep(_POLL_INTERVAL)
         except asyncio.CancelledError:
             pass
+
+    async def _give_up_link(self) -> None:
+        """Treat a link that no longer takes polls as disconnected.
+
+        The device only streams status while polled, so without the poll
+        loop the status would silently freeze while `connected` stays True.
+        Close the client and report the disconnect so callers reconnect.
+        """
+        self._poll_task = None  # we are that task; don't cancel ourselves
+        client = self._client
+        was_connected = self._connected
+        self._mark_link_down()
+        if was_connected:
+            self._report_disconnect()
+        if client is not None and client.is_connected:
+            try:
+                await client.disconnect()
+            except Exception as err:
+                _LOGGER.debug("Sperax: error closing dead link: %s", err)
 
     # --- Write helper ---
 
@@ -384,42 +454,81 @@ class SperaxController:
         reaches the elapsed-second count. Steps were confirmed on-device by the
         owner (hass-walkingpad#3).
         """
-        if len(inner) < 19:
+        if len(inner) < _STATUS_MIN_LEN:
             return
 
-        speed_raw = inner[15]
-        self._status.speed = speed_raw / 10.0
-        if speed_raw > 0:
-            self._status.belt_state = BeltState.ACTIVE
-        else:
-            self._status.belt_state = BeltState.STOPPED
+        state = inner[_STATUS_OFF_STATE]
+        speed_tenths = inner[_STATUS_OFF_SPEED]
+        incline = inner[_STATUS_OFF_INCLINE]
 
-        # The vibration-level field (offset 18) holds the *last selected*
-        # level and is not cleared when vibration turns off — the device
-        # signals "vibration active" via the state byte (offset 4 == 0x50).
-        # Report a level only while actually vibrating, else 0.
-        vib = inner[18] if inner[4] == _STATUS_STATE_VIBRATION else 0
-        self._vibration_level = vib
-        self._status.vibration_level = vib
-        self._status.incline = inner[16]
+        self._device_state = state
+        self._status.speed = speed_tenths / 10.0
+        self._update_belt_state(state, speed_tenths)
+        self._follow_device_speed(state, speed_tenths)
+
+        # The vibration-level field holds the *last selected* level and is
+        # not cleared when vibration turns off — the device signals
+        # "vibration active" via the state byte (0x50). Report a level only
+        # while actually vibrating, else 0.
+        vibration_level = (
+            inner[_STATUS_OFF_VIBRATION] if state == _STATUS_STATE_VIBRATION else 0
+        )
+        self._vibration_level = vibration_level
+        self._status.vibration_level = vibration_level
+        self._status.incline = incline
 
         # Adopt the device's actual speed/incline as our run targets on the
         # first status frame after (re)connecting — the device is the source
         # of truth. Without this, the freshly-created controller would keep its
         # default targets (min speed, flat), so the next run command (e.g. from
-        # an incline nudge) would wrongly slow the belt to minimum.
+        # an incline nudge) would wrongly slow the belt to minimum. Runs after
+        # `_follow_device_speed`, whose target it may overwrite.
         if not self._synced_from_device:
-            self._target_speed_tenths = speed_raw
-            self._target_incline = inner[16]
+            # A stopped belt reports 0 km/h; keep the minimum speed as the
+            # target then, or the next run command would stop the belt.
+            if speed_tenths > 0:
+                self._target_speed_tenths = speed_tenths
+            self._target_incline = incline
             self._synced_from_device = True
 
         # Session counters.
-        self._status.duration = inner[8] | (inner[9] << 8)  # seconds
-        self._status.distance = (inner[10] | (inner[11] << 8)) * 10  # metres (10 m units)
-        self._status.steps = inner[14]
+        off = _STATUS_OFF_DURATION
+        self._status.duration = inner[off] | (inner[off + 1] << 8)  # seconds
+        off = _STATUS_OFF_DISTANCE
+        self._status.distance = (inner[off] | (inner[off + 1] << 8)) * _DISTANCE_UNIT_M
+        self._status.steps = inner[_STATUS_OFF_STEPS]
 
         self._status.timestamp = time.time()
         self._notify_status()
+
+    def _update_belt_state(self, state: int, speed_tenths: int) -> None:
+        """Derive `belt_state` and clear the pause latch from one frame."""
+        if state == _STATUS_STATE_RUNNING and speed_tenths > 0:
+            self._paused = False  # resumed, e.g. from the remote
+        elif state == _STATUS_STATE_IDLE:
+            self._paused = False  # session ended on the device
+        if speed_tenths > 0:
+            self._status.belt_state = BeltState.ACTIVE
+        elif self._paused:
+            self._status.belt_state = BeltState.PAUSED
+        else:
+            self._status.belt_state = BeltState.STOPPED
+
+    def _follow_device_speed(self, state: int, speed_tenths: int) -> None:
+        """Keep the run target in line with the device where we don't own it."""
+        if state == _STATUS_STATE_IDLE:
+            # No session: the next start() begins at the minimum speed
+            # instead of the previous session's target.
+            self._target_speed_tenths = self._min_speed_tenths()
+            self._speed_from_us = False
+        elif (
+            state == _STATUS_STATE_RUNNING
+            and speed_tenths > 0
+            and not self._speed_from_us
+        ):
+            # Known limitation: once we set a speed, a later change from the
+            # remote is not adopted, so the next incline change restores ours.
+            self._target_speed_tenths = speed_tenths
 
     # --- Commands ---
 
@@ -428,32 +537,42 @@ class SperaxController:
         # We now have explicit intent; don't let a passive status frame
         # overwrite these targets via the on-connect device sync.
         self._synced_from_device = True
-        speed = max(
-            0,
-            min(int(round(self._max_speed_tenths())), self._target_speed_tenths),
-        )
+        speed = max(0, min(self._max_speed_tenths(), self._target_speed_tenths))
         inner = bytes(
             [0x00, _CMD_RUN, _RUN_STATE_RUN, speed & 0xFF, self._target_incline & 0xFF]
         )
+        if not await self._try_write(inner, "run command"):
+            return False
+        self._paused = False
+        return True
+
+    async def _try_write(self, inner: bytes, what: str) -> bool:
+        """Write a command; log and return False on a BLE error."""
         try:
             await self._write(inner)
-            return True
         except BleakError as err:
-            _LOGGER.warning("Sperax: run command failed: %s", err)
+            _LOGGER.warning("Sperax: %s failed: %s", what, err)
             return False
+        return True
+
+    def _min_speed_tenths(self) -> int:
+        return int(round(self.min_speed * 10))
 
     def _max_speed_tenths(self) -> int:
         return int(round(self.max_speed * 10))
 
     async def start(self) -> bool:
-        """Start the belt at the minimum speed.
+        """Start or resume the belt at the cached target speed (min. minimum).
 
-        Mirrors the other backends: start does not jump straight to a high
-        speed. Callers set the desired speed afterwards via set_target_speed().
+        The target starts at the minimum speed, is adopted from a running
+        belt on the first status frame after connecting, is reset to the
+        minimum by stop() and kept by pause(). Callers set the desired
+        speed via set_target_speed().
         """
         self._target_speed_tenths = max(
-            int(round(self.min_speed * 10)), self._target_speed_tenths
+            self._min_speed_tenths(), self._target_speed_tenths
         )
+        self._speed_from_us = True
         return await self._send_run()
 
     async def stop(self) -> bool:
@@ -470,15 +589,21 @@ class SperaxController:
         drive the bed, so the next start actually levels it — the stop frame
         itself carries incline 0 but the device does not level from a stop.)
         """
-        try:
-            await self._write(bytes([0x00, _CMD_RUN, _RUN_STATE_STOP, 0x00, 0x00]))
-            self._target_speed_tenths = int(round(self.min_speed * 10))
-            self._target_incline = 0
-            self._synced_from_device = True
-            return True
-        except BleakError as err:
-            _LOGGER.warning("Sperax: stop failed: %s", err)
+        # Invalidate "running" before the write: an incline change racing
+        # this stop must not send a RUN that restarts the belt.
+        self._device_state = None
+        if not await self._try_write(
+            bytes([0x00, _CMD_RUN, _RUN_STATE_STOP, 0x00, 0x00]), "stop"
+        ):
             return False
+        self._target_speed_tenths = self._min_speed_tenths()
+        self._target_incline = 0
+        self._synced_from_device = True
+        self._paused = False
+        # Again: a status frame may have restored it during the write.
+        self._device_state = None
+        self._speed_from_us = False
+        return True
 
     async def pause(self) -> bool:
         """Pause the belt, keeping the session (``15 02 00 00``).
@@ -488,18 +613,28 @@ class SperaxController:
         are left intact, so a subsequent start() resumes the previous run —
         matching the FTMS backend's pause() semantics.
         """
-        try:
-            await self._write(bytes([0x00, _CMD_RUN, _RUN_STATE_PAUSE, 0x00, 0x00]))
-            self._synced_from_device = True
-            return True
-        except BleakError as err:
-            _LOGGER.warning("Sperax: pause failed: %s", err)
+        was_running = (
+            self._status.speed > 0 or self._device_state == _STATUS_STATE_RUNNING
+        )
+        # As in stop(): no RUN from a racing incline change after this point.
+        self._device_state = None
+        if not await self._try_write(
+            bytes([0x00, _CMD_RUN, _RUN_STATE_PAUSE, 0x00, 0x00]), "pause"
+        ):
             return False
+        self._synced_from_device = True
+        # Pausing an idle belt doesn't create a paused session; pausing
+        # again keeps an existing one.
+        self._paused = self._paused or was_running
+        # Again: a status frame may have restored it during the write.
+        self._device_state = None
+        return True
 
     async def set_target_speed(self, speed_kmh: float) -> bool:
         """Set the belt speed in km/h."""
         speed_kmh = max(self.min_speed, min(self.max_speed, speed_kmh))
         self._target_speed_tenths = int(round(speed_kmh * 10))
+        self._speed_from_us = True
         return await self._send_run()
 
     async def set_target_inclination(self, incline_step: int) -> bool:
@@ -509,13 +644,14 @@ class SperaxController:
         discrete steps, clamped to 0..10.
 
         Incline rides inside the run command (``15 01 <speed> <incline>``), so
-        applying it re-sends a run. We only do that while the belt is already
-        moving — sending it while stopped would start the belt. When stopped we
-        just cache the target; it is applied on the next start()/set_speed().
+        applying it re-sends a run. We only do that while the device reports
+        the belt as running — sending it while stopped, paused or still
+        decelerating would (re)start the belt. Otherwise we just cache the
+        target; it is applied on the next start()/set_speed().
         """
         self._target_incline = max(0, min(_MAX_INCLINE, int(incline_step)))
         self._synced_from_device = True
-        if self._status.speed > 0:
+        if self._device_state == _STATUS_STATE_RUNNING and self._status.speed > 0:
             return await self._send_run()
         return True
 
@@ -527,21 +663,18 @@ class SperaxController:
         """
         level = max(0, min(_MAX_VIBRATION, int(level)))
         state = _VIB_STATE_ON if level > 0 else _VIB_STATE_OFF
-        try:
-            await self._write(bytes([0x00, _CMD_VIBRATION, state, level & 0xFF]))
-            self._vibration_level = level
-            return True
-        except BleakError as err:
-            _LOGGER.warning("Sperax: set vibration failed: %s", err)
+        if not await self._try_write(
+            bytes([0x00, _CMD_VIBRATION, state, level & 0xFF]), "set vibration"
+        ):
             return False
+        self._vibration_level = level
+        return True
 
     async def switch_mode(self, mode: int) -> bool:
         """Switch operating mode (compat shim).
 
         The P3 Max has no auto/manual mode concept; STANDBY (2) maps to stop.
         """
-        from .const import OperatingMode
-
         if mode == OperatingMode.STANDBY.value:
             return await self.stop()
         if mode == OperatingMode.AUTO.value:
