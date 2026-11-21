@@ -109,7 +109,9 @@ class WalkingPadController:
     def _backend(self):
         """The active protocol backend, or None before connecting.
 
-        At most one of the three is set (see `_close_backend`).
+        Only one backend is ever set: each `_connect_*` sets its own after
+        `connect()` cleared all three via `_close_backend`. Backends define
+        no ``__bool__``, so ``or`` picks the first one that is not None.
         """
         return self._ftms or self._wilink or self._sperax
 

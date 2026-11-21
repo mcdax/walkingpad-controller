@@ -564,8 +564,9 @@ class SperaxController:
     async def start(self) -> bool:
         """Start or resume the belt at the cached target speed (min. minimum).
 
-        After connect or stop() the target is the minimum speed; after
-        pause() it is the previous run's speed. Callers set the desired
+        The target starts at the minimum speed, is adopted from a running
+        belt on the first status frame after connecting, is reset to the
+        minimum by stop() and kept by pause(). Callers set the desired
         speed via set_target_speed().
         """
         self._target_speed_tenths = max(

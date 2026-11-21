@@ -745,3 +745,18 @@ def test_replay_during_the_cccd_write_is_still_dropped(monkeypatch) -> None:
     c._client = SimpleNamespace(is_connected=True, start_notify=start_notify)  # type: ignore[assignment]
     asyncio.run(c._subscribe_notifications())
     assert c._paused is False
+
+
+def test_subscription_table_matches_the_resubscribe_list(monkeypatch) -> None:
+    from walkingpad_controller import ftms
+
+    monkeypatch.setattr(ftms.asyncio, "sleep", _no_sleep)
+    c = FTMSController()
+    order: list[str] = []
+
+    async def start_notify(uuid, handler):
+        order.append(uuid)
+
+    c._client = SimpleNamespace(is_connected=True, start_notify=start_notify)  # type: ignore[assignment]
+    asyncio.run(c._subscribe_notifications())
+    assert tuple(order) == ftms._CONNECT_SUBSCRIPTION_UUIDS

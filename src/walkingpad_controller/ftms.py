@@ -97,7 +97,8 @@ class _Subscription(NamedTuple):
     required: bool  # a failure fails the connect
 
 
-# Characteristics `_subscribe_notifications` subscribes to, in order.
+# Characteristics `_subscribe_notifications` subscribes to, in order (kept in
+# sync with its table; checked by a test).
 _CONNECT_SUBSCRIPTION_UUIDS = (
     TREADMILL_DATA_UUID,
     FITNESS_MACHINE_STATUS_UUID,
@@ -411,8 +412,8 @@ class FTMSController:
         self._connected = False
         self._has_control = False
         self._paused = False
-        # Re-arm the first-event skip so the next connection's stale
-        # 2ADA replay is also dropped.
+        # Re-arm the replay check so the next connection's stale 2ADA
+        # replay is also dropped.
         self._machine_status_first_event_seen = False
         self._status_subscribed_at = None
         self._status.speed = 0.0
@@ -577,7 +578,6 @@ class FTMSController:
                 True,
             ),
         )
-        assert tuple(sub.uuid for sub in subscriptions) == _CONNECT_SUBSCRIPTION_UUIDS
 
         for uuid, handler, label, delay_after, required in subscriptions:
             try:
