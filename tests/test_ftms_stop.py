@@ -104,7 +104,7 @@ class Pad:
         async def run() -> bool:
             # by default, mark the first FM Status event as already seen so
             # the simulated events take the normal path
-            self.c._machine_status_first_event_skipped = first_status_event_seen
+            self.c._machine_status_first_event_seen = first_status_event_seen
             try:
                 return await self.c.stop()
             finally:

@@ -12,8 +12,8 @@ Basic control (start/stop/speed) uses standard FTMS Control Point only.
 
 BLE Connection Stability Note:
   KingSmith FTMS devices (e.g., KS-Z1D) at weak signal (~-77 dBm RSSI)
-  may experience frequent BLE disconnects. The implementation includes
-  retry logic and cold-start handling to deal with this.
+  may experience frequent BLE disconnects. This module handles cold starts
+  and setup failures; connection retries live in `WalkingPadController`.
 
 Protocol reference:
   - Bluetooth SIG FTMS specification (Fitness Machine Service)
@@ -27,13 +27,14 @@ import enum
 import logging
 import struct
 import time
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 from bleak_retry_connector import establish_connection
 
+from ._callbacks import fire_callbacks
 from .const import (
     FITNESS_MACHINE_STATUS_UUID,
     FTMS_CONTROL_POINT_UUID,
@@ -61,6 +62,14 @@ _LOGGER = logging.getLogger(__name__)
 # not the firmware's replay of its previous state.
 _STATUS_REPLAY_WINDOW = 2.0
 
+# How long a Control Point write waits for its acknowledgement. On the vendor
+# pre-amble path this replaces (not caps) the caller's timeout.
+_CP_ACK_TIMEOUT = 5.0
+_CP_ACK_TIMEOUT_PREAMBLE = 3.0
+
+# How long start() waits for the belt to move after START_OR_RESUME.
+_START_MOTION_TIMEOUT = 15.0
+
 
 # Mapping from FTMS Control Point opcode to the Fitness Machine Status (2ADA)
 # event that confirms the command was applied. Used on the pre-amble path,
@@ -76,6 +85,32 @@ _CP_TO_STATUS_ACK: dict[int, int] = {
 def _needs_pause_before_stop(name: str | None) -> bool:
     """Return whether a device with this BLE name rejects STOP while moving."""
     return (name or "").upper().startswith(FTMS_PAUSE_BEFORE_STOP_PREFIXES)
+
+
+class _Subscription(NamedTuple):
+    """One notification subscription made while connecting."""
+
+    uuid: str
+    handler: Callable[[int, bytearray], None]
+    label: str
+    delay_after: float  # seconds to wait before the next CCCD write
+    required: bool  # a failure fails the connect
+
+
+# Characteristics `_subscribe_notifications` subscribes to, in order.
+_CONNECT_SUBSCRIPTION_UUIDS = (
+    TREADMILL_DATA_UUID,
+    FITNESS_MACHINE_STATUS_UUID,
+    FTMS_CONTROL_POINT_UUID,
+)
+
+
+async def _wait_event(event: asyncio.Event, timeout: float) -> None:
+    """Wait until ``event`` is set or ``timeout`` passes, whichever is first."""
+    try:
+        await asyncio.wait_for(event.wait(), timeout)
+    except asyncio.TimeoutError:
+        pass
 
 
 class _CPResult(enum.Enum):
@@ -120,10 +155,11 @@ class FTMSController:
 
         # KingSmith firmware fires its current state on the 0x2ADA char as
         # soon as the CCCD is enabled — typically a stale STOPPED_OR_PAUSED
-        # event from before HA connected. Skipping the first event after
-        # subscribe prevents `last_fm_event` from showing this stale value
-        # on every reconnect. See FTMS reverse-engineering doc, §6.3.
-        self._machine_status_first_event_skipped = False
+        # event from before HA connected. The first event after subscribing
+        # is dropped if it looks like that replay (see
+        # `_is_stale_status_replay`); this flag is set once it was examined.
+        # See FTMS reverse-engineering doc, §6.3.
+        self._machine_status_first_event_seen = False
         # When 0x2ADA was subscribed (monotonic). Only a first event that
         # arrives shortly after subscribing is treated as a stale replay.
         self._status_subscribed_at: float | None = None
@@ -238,11 +274,9 @@ class FTMSController:
 
     def _notify_status(self) -> None:
         """Notify all registered callbacks of a status update."""
-        for cb in self._status_callbacks:
-            try:
-                cb(self._status)
-            except Exception:
-                _LOGGER.exception("Error in status callback")
+        fire_callbacks(
+            self._status_callbacks, _LOGGER, "Error in status callback", self._status
+        )
 
     # --- Connection ---
 
@@ -363,11 +397,9 @@ class FTMSController:
             return  # a retired client from an earlier connection
         _LOGGER.warning("FTMS: Device disconnected")
         self._reset_link_state()
-        for cb in self._disconnect_callbacks:
-            try:
-                cb()
-            except Exception:
-                _LOGGER.exception("Error in disconnect callback")
+        fire_callbacks(
+            self._disconnect_callbacks, _LOGGER, "Error in disconnect callback"
+        )
 
     def _reset_link_state(self) -> None:
         """Forget per-connection state after a disconnect.
@@ -381,7 +413,7 @@ class FTMSController:
         self._paused = False
         # Re-arm the first-event skip so the next connection's stale
         # 2ADA replay is also dropped.
-        self._machine_status_first_event_skipped = False
+        self._machine_status_first_event_seen = False
         self._status_subscribed_at = None
         self._status.speed = 0.0
         self._status.belt_state = BeltState.STOPPED
@@ -504,8 +536,8 @@ class FTMSController:
 
         KingSmith firmware silently drops CCCD writes that arrive in close
         succession. KS Fit staggers its subscriptions with progressive delays
-        of 100/200/300 ms — we mirror that. See `docs/ftms-protocol-reference.md`
-        §2.1 for the analysis behind these numbers.
+        (100/200/300 ms); we wait 100 ms after Treadmill Data and 200 ms after
+        FM Status. See `docs/ftms-protocol-reference.md` §2.1.
         """
         if not self._client:
             return
@@ -526,17 +558,26 @@ class FTMSController:
         # be confirmed, so a failed subscription fails the connect (and the
         # caller retries) instead of leaving a half-working link.
         subscriptions = (
-            (TREADMILL_DATA_UUID, self._on_treadmill_data, "Treadmill Data", 0.10, True),
+            _Subscription(
+                TREADMILL_DATA_UUID, self._on_treadmill_data, "Treadmill Data", 0.10, True
+            ),
             # On the vendor pre-amble path FM Status is the only ack channel.
-            (
+            _Subscription(
                 FITNESS_MACHINE_STATUS_UUID,
                 self._on_machine_status,
                 "Fitness Machine Status",
                 0.20,
                 self._capabilities.has_vendor_preamble,
             ),
-            (FTMS_CONTROL_POINT_UUID, self._on_control_point_response, "Control Point", 0.0, True),
+            _Subscription(
+                FTMS_CONTROL_POINT_UUID,
+                self._on_control_point_response,
+                "Control Point",
+                0.0,
+                True,
+            ),
         )
+        assert tuple(sub.uuid for sub in subscriptions) == _CONNECT_SUBSCRIPTION_UUIDS
 
         for uuid, handler, label, delay_after, required in subscriptions:
             try:
@@ -574,21 +615,26 @@ class FTMSController:
                     self._telemetry_check_timeout,
                 )
                 assert self._client is not None
-                for uuid in (
-                    TREADMILL_DATA_UUID,
-                    FITNESS_MACHINE_STATUS_UUID,
-                    FTMS_CONTROL_POINT_UUID,
-                ):
+                for uuid in _CONNECT_SUBSCRIPTION_UUIDS:
                     try:
                         await self._client.stop_notify(uuid)
                     except Exception as err:
                         _LOGGER.debug("FTMS: stop_notify %s failed: %s", uuid, err)
                 # The resubscribe triggers a fresh 0x2ADA replay; drop it too.
-                self._machine_status_first_event_skipped = False
+                self._machine_status_first_event_seen = False
                 await self._subscribe_notifications()
         _LOGGER.warning(
             "FTMS: still no Treadmill Data after resubscribing; continuing"
         )
+
+    async def _wait_for_next_frame(self, timeout: float) -> None:
+        """Sleep until the next Treadmill Data frame (or disconnect/timeout).
+
+        Callers check their condition right before this, with no await in
+        between, so clearing the event here can't lose a wake-up.
+        """
+        self._treadmill_data_event.clear()
+        await _wait_event(self._treadmill_data_event, timeout)
 
     async def _wait_for_frame(self, timeout: float) -> bool:
         """Wait for any Treadmill Data frame; False on timeout or disconnect."""
@@ -599,11 +645,7 @@ class FTMSController:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return False
-            self._treadmill_data_event.clear()
-            try:
-                await asyncio.wait_for(self._treadmill_data_event.wait(), remaining)
-            except asyncio.TimeoutError:
-                pass
+            await self._wait_for_next_frame(remaining)
         return self.connected and self._treadmill_data_seq != seq
 
     async def subscribe_training_status(self) -> bool:
@@ -741,6 +783,9 @@ class FTMSController:
         these events are how command success is signalled — the device
         sends *no* indication on the Control Point itself for opcodes other
         than REQUEST_CONTROL.
+
+        Order matters: count session ends, drop a stale replay, signal a
+        pending ack, apply the state change, then publish.
         """
         if len(data) < 1:
             return
@@ -750,10 +795,10 @@ class FTMSController:
             "FTMS: Machine status event: 0x%02x (data: %s)", opcode, data.hex()
         )
 
-        # Count session ends before the first-event skip below: _send_stop()
-        # only looks at the change across its own STOP write, so a stale
-        # replay counted at subscribe time does no harm, while dropping a
-        # real 02 01 would make a successful STOP look failed.
+        # Count session ends before the replay check: _send_stop() only looks
+        # at the change across its own STOP write, so a stale replay counted
+        # at subscribe time does no harm, while dropping a real 02 01 would
+        # make a successful STOP look failed.
         if (
             opcode == FitnessMachineStatusOpcode.STOPPED_OR_PAUSED
             and len(data) >= 2
@@ -762,51 +807,8 @@ class FTMSController:
             self._session_end_events += 1
             self._session_end_event.set()
 
-        # The very first 2ADA event after subscribing is sometimes the
-        # device replaying its prior state — typically a stale
-        # STOPPED_OR_PAUSED carried over from before we connected. We
-        # used to drop that unconditionally so `last_fm_event` wouldn't
-        # flap on every reconnect.
-        #
-        # That over-filtered when the user's first command lands an ack
-        # *as* the first event: e.g. pause() right after a fresh
-        # connect → the FM Status PAUSE arrives before any other event,
-        # and dropping it lost the `_paused = True` state update,
-        # leaving belt_state derived as STOPPED instead of PAUSED.
-        #
-        # Heuristic: if the first event matches what we're currently
-        # waiting for, treat it as the real ack and apply state
-        # changes (fall through). Otherwise skip — most likely a
-        # stale replay.
-        if not self._machine_status_first_event_skipped:
-            self._machine_status_first_event_skipped = True
-            late = (
-                self._status_subscribed_at is None
-                or time.monotonic() - self._status_subscribed_at
-                > _STATUS_REPLAY_WINDOW
-            )
-            if late:
-                # Too long after subscribing to be the replay. On devices
-                # without the vendor pre-amble there is never an expected
-                # ack opcode, so this is how their first real event survives.
-                pass
-            elif (
-                self._status_ack_expected_opcode is not None
-                and opcode == self._status_ack_expected_opcode
-            ):
-                _LOGGER.debug(
-                    "FTMS: First 2ADA event after subscribe matches expected "
-                    "ack opcode 0x%02x — treating as real ack, not stale replay",
-                    opcode,
-                )
-                # Fall through to the normal handler below.
-            else:
-                _LOGGER.debug(
-                    "FTMS: Ignoring first 2ADA event after subscribe "
-                    "(opcode 0x%02x, no matching pending command)",
-                    opcode,
-                )
-                return
+        if self._is_stale_status_replay(opcode):
+            return
 
         # Wake any pending command waiter that's expecting this opcode.
         if (
@@ -819,6 +821,56 @@ class FTMSController:
         ):
             self._status_ack_event.set()
 
+        self._apply_machine_status(opcode, data)
+
+        # Record the most-recent processed event so callers can read it via
+        # `controller.status.last_fm_event`, and fan out to the status
+        # callbacks (e.g. HA coordinator) once all state above is updated.
+        self._status.last_fm_event = opcode
+        self._status.timestamp = time.time()
+        self._notify_status()
+
+    def _is_stale_status_replay(self, opcode: int) -> bool:
+        """Return True for the firmware's replay of its state on subscribe.
+
+        The first 2ADA event after subscribing is often the device replaying
+        its prior state (typically a stale STOPPED_OR_PAUSED). Only that
+        first event is considered, and only if it arrives within
+        `_STATUS_REPLAY_WINDOW` of subscribing and doesn't match the ack
+        opcode a pending command expects (e.g. pause() right after connect,
+        whose PAUSE event may be the first one).
+        """
+        if self._machine_status_first_event_seen:
+            return False
+        self._machine_status_first_event_seen = True
+        late = (
+            self._status_subscribed_at is None
+            or time.monotonic() - self._status_subscribed_at > _STATUS_REPLAY_WINDOW
+        )
+        if late:
+            # Too long after subscribing to be the replay. On devices
+            # without the vendor pre-amble there is never an expected ack
+            # opcode, so this is how their first real event survives.
+            return False
+        if (
+            self._status_ack_expected_opcode is not None
+            and opcode == self._status_ack_expected_opcode
+        ):
+            _LOGGER.debug(
+                "FTMS: First 2ADA event after subscribe matches expected "
+                "ack opcode 0x%02x — treating as real ack, not stale replay",
+                opcode,
+            )
+            return False
+        _LOGGER.debug(
+            "FTMS: Ignoring first 2ADA event after subscribe "
+            "(opcode 0x%02x, no matching pending command)",
+            opcode,
+        )
+        return True
+
+    def _apply_machine_status(self, opcode: int, data: bytearray) -> None:
+        """Update pause/belt state (and log) for one FM Status event."""
         if opcode == FitnessMachineStatusOpcode.STOPPED_OR_PAUSED:
             if len(data) >= 2:
                 if data[1] == FTMSStopPauseParam.STOP:
@@ -832,11 +884,10 @@ class FTMSController:
                 elif data[1] == FTMSStopPauseParam.PAUSE:
                     _LOGGER.info("FTMS: Treadmill paused by user")
                     self._paused = True
+                    # While decelerating, Treadmill Data keeps belt_state
+                    # ACTIVE and switches to PAUSED at 0 km/h.
                     if self._status.speed == 0:
                         self._status.belt_state = BeltState.PAUSED
-                    # Belt is still decelerating at this moment — TM Data
-                    # will keep belt_state = ACTIVE while speed > 0, then
-                    # transition to PAUSED when it reaches zero.
         elif opcode == FitnessMachineStatusOpcode.STOPPED_BY_SAFETY_KEY:
             _LOGGER.info("FTMS: Treadmill stopped by safety key")
             self._paused = False
@@ -844,9 +895,8 @@ class FTMSController:
                 self._status.belt_state = BeltState.STOPPED
         elif opcode == FitnessMachineStatusOpcode.STARTED_OR_RESUMED:
             _LOGGER.info("FTMS: Treadmill started/resumed by user")
-            # `_paused` will be cleared automatically when TM Data shows
-            # speed > 0; clear it here too in case TM Data hasn't arrived
-            # yet, to avoid a transient PAUSED reading right after resume.
+            # Treadmill Data never clears `_paused`; only FM Status events
+            # (and a disconnect) do.
             self._paused = False
         elif opcode == FitnessMachineStatusOpcode.TARGET_SPEED_CHANGED:
             if len(data) >= 3:
@@ -860,13 +910,6 @@ class FTMSController:
                 _LOGGER.info(
                     "FTMS: Target inclination changed to %.1f%%", incl_raw / 10.0
                 )
-
-        # Record the most-recent event so callers can read it via
-        # `controller.status.last_fm_event`, and fan out to the status
-        # callbacks (e.g. HA coordinator) once all state above is updated.
-        self._status.last_fm_event = opcode
-        self._status.timestamp = time.time()
-        self._notify_status()
 
     def _on_training_status(self, sender: int, data: bytearray) -> None:
         """Handle Training Status (2AD3) notifications.
@@ -916,7 +959,7 @@ class FTMSController:
     # --- Control Commands ---
 
     async def _write_control_point(
-        self, opcode: FTMSOpcode, params: bytes = b"", timeout: float = 5.0
+        self, opcode: FTMSOpcode, params: bytes = b"", timeout: float = _CP_ACK_TIMEOUT
     ) -> bool:
         """Write a command to the FTMS Control Point and wait for response.
 
@@ -930,7 +973,7 @@ class FTMSController:
         return result is _CPResult.ACK
 
     async def _write_control_point_result(
-        self, opcode: FTMSOpcode, params: bytes = b"", timeout: float = 5.0
+        self, opcode: FTMSOpcode, params: bytes = b"", timeout: float = _CP_ACK_TIMEOUT
     ) -> _CPResult:
         """Like `_write_control_point`, but report how the write ended.
 
@@ -957,32 +1000,8 @@ class FTMSController:
         assert client is not None
 
         if self._capabilities.has_vendor_preamble:
-            try:
-                await client.write_gatt_char(
-                    KINGSMITH_VENDOR_PREAMBLE_UUID,
-                    KINGSMITH_VENDOR_PREAMBLE_PAYLOAD,
-                    response=True,
-                )
-            except BleakError as err:
-                _LOGGER.debug("FTMS: Vendor pre-amble write error: %s", err)
-
-        # On the pre-amble path, the device acknowledges most opcodes via a
-        # Fitness Machine Status (2ADA) event rather than a Control Point
-        # indication. Set up an expectation now so the status handler can
-        # signal us when the matching event arrives. STOP_OR_PAUSE is acked
-        # by STOPPED_OR_PAUSED with the same parameter, so a PAUSE event
-        # can't acknowledge a STOP.
-        expected_status_opcode = (
-            _CP_TO_STATUS_ACK.get(opcode)
-            if self._capabilities.has_vendor_preamble
-            else None
-        )
-        if expected_status_opcode is not None:
-            self._status_ack_expected_opcode = expected_status_opcode
-            self._status_ack_expected_param = (
-                params[0] if opcode == FTMSOpcode.STOP_OR_PAUSE and params else None
-            )
-        self._status_ack_event.clear()
+            await self._write_vendor_preamble(client)
+        expected_status_opcode = self._arm_status_ack(opcode, params)
 
         command = bytes([opcode]) + params
         _LOGGER.debug("FTMS: Sending control point command: %s", command.hex())
@@ -1001,21 +1020,77 @@ class FTMSController:
             _LOGGER.warning("FTMS: Write error: %s", err)
             return _CPResult.NOT_SENT
 
-        # Wait for either a Control Point indication OR a matching Fitness
-        # Machine Status event. On standard FTMS firmware the indication
-        # arrives quickly (sub-second). On the pre-amble path most opcodes
-        # only get a 2ADA event; first-call REQUEST_CONTROL still gets an
-        # indication. Race them so whichever arrives first wins. A late
-        # indication for an earlier command is ignored and we keep waiting.
+        result = await self._await_cp_ack(opcode, expected_status_opcode, timeout)
+        if result is not None:
+            return result
+
+        # Neither arrived in time. On the pre-amble path the firmware often
+        # applies a command without any ack (issue #1), so
+        # `_write_control_point` treats this as success there.
+        if self._capabilities.has_vendor_preamble:
+            _LOGGER.debug(
+                "FTMS: No ack for opcode 0x%02x (vendor pre-amble path)", opcode
+            )
+        else:
+            _LOGGER.warning(
+                "FTMS: Control point response timeout for opcode 0x%02x", opcode
+            )
+        return _CPResult.TIMEOUT
+
+    async def _write_vendor_preamble(self, client: BleakClient) -> None:
+        """Send the KingSmith vendor pre-amble; errors are only logged."""
+        try:
+            await client.write_gatt_char(
+                KINGSMITH_VENDOR_PREAMBLE_UUID,
+                KINGSMITH_VENDOR_PREAMBLE_PAYLOAD,
+                response=True,
+            )
+        except BleakError as err:
+            _LOGGER.debug("FTMS: Vendor pre-amble write error: %s", err)
+
+    def _arm_status_ack(self, opcode: FTMSOpcode, params: bytes) -> int | None:
+        """Set up the FM Status ack expectation; return its opcode, if any.
+
+        On the pre-amble path, the device acknowledges most opcodes via a
+        Fitness Machine Status (2ADA) event rather than a Control Point
+        indication, so the status handler signals us when the matching
+        event arrives. STOP_OR_PAUSE is acked by STOPPED_OR_PAUSED with the
+        same parameter, so a PAUSE event can't acknowledge a STOP.
+        """
+        expected_status_opcode = (
+            _CP_TO_STATUS_ACK.get(opcode)
+            if self._capabilities.has_vendor_preamble
+            else None
+        )
+        if expected_status_opcode is not None:
+            self._status_ack_expected_opcode = expected_status_opcode
+            self._status_ack_expected_param = (
+                params[0] if opcode == FTMSOpcode.STOP_OR_PAUSE and params else None
+            )
+        self._status_ack_event.clear()
+        return expected_status_opcode
+
+    async def _await_cp_ack(
+        self, opcode: FTMSOpcode, expected_status_opcode: int | None, timeout: float
+    ) -> _CPResult | None:
+        """Wait for this command's ack; None if nothing arrived in time.
+
+        Waits for either a Control Point indication OR a matching Fitness
+        Machine Status event. On standard FTMS firmware the indication
+        arrives quickly (sub-second). On the pre-amble path most opcodes
+        only get a 2ADA event; first-call REQUEST_CONTROL still gets an
+        indication. Race them so whichever arrives first wins. A late
+        indication for an earlier command is ignored and we keep waiting.
+        """
         effective_timeout = (
-            3.0 if self._capabilities.has_vendor_preamble else timeout
+            _CP_ACK_TIMEOUT_PREAMBLE if self._capabilities.has_vendor_preamble else timeout
         )
         loop = asyncio.get_running_loop()
         deadline = loop.time() + effective_timeout
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
-                break
+                return None
             waiters = [asyncio.create_task(self._cp_response_event.wait())]
             if expected_status_opcode is not None:
                 waiters.append(asyncio.create_task(self._status_ack_event.wait()))
@@ -1041,43 +1116,39 @@ class FTMSController:
                 return _CPResult.ACK
 
             if not self._cp_response_event.is_set():
-                break  # timed out
+                return None  # timed out
 
-            # Parse response: [0x80, request_opcode, result_code]
-            resp = self._cp_response_data
-            if len(resp) >= 3 and resp[0] == FTMSOpcode.RESPONSE_CODE:
-                req_opcode = resp[1]
-                result = resp[2]
-                if req_opcode != opcode:
-                    _LOGGER.debug(
-                        "FTMS: Ignoring late indication for opcode 0x%02x while "
-                        "waiting for 0x%02x",
-                        req_opcode,
-                        opcode,
-                    )
-                    self._cp_response_event.clear()
-                    continue
-                if result == FTMSResultCode.SUCCESS:
-                    _LOGGER.debug("FTMS: Command 0x%02x succeeded", opcode)
-                    return _CPResult.ACK
-                _LOGGER.warning("FTMS: Command 0x%02x result: %d", opcode, result)
-                return _CPResult.REJECTED
+            result = self._parse_cp_response(opcode)
+            if result is not None:
+                return result
+            self._cp_response_event.clear()  # late indication; keep waiting
 
-            _LOGGER.warning("FTMS: Unexpected control point response: %s", resp.hex())
+    def _parse_cp_response(self, opcode: FTMSOpcode) -> _CPResult | None:
+        """Interpret the indication in the response slot for ``opcode``.
+
+        Format: [0x80, request_opcode, result_code]. Returns None for an
+        indication that belongs to another opcode.
+        """
+        resp = self._cp_response_data
+        if len(resp) >= 3 and resp[0] == FTMSOpcode.RESPONSE_CODE:
+            req_opcode = resp[1]
+            result = resp[2]
+            if req_opcode != opcode:
+                _LOGGER.debug(
+                    "FTMS: Ignoring late indication for opcode 0x%02x while "
+                    "waiting for 0x%02x",
+                    req_opcode,
+                    opcode,
+                )
+                return None
+            if result == FTMSResultCode.SUCCESS:
+                _LOGGER.debug("FTMS: Command 0x%02x succeeded", opcode)
+                return _CPResult.ACK
+            _LOGGER.warning("FTMS: Command 0x%02x result: %d", opcode, result)
             return _CPResult.REJECTED
 
-        # Neither arrived in time. On the pre-amble path the firmware often
-        # applies a command without any ack (issue #1), so
-        # `_write_control_point` treats this as success there.
-        if self._capabilities.has_vendor_preamble:
-            _LOGGER.debug(
-                "FTMS: No ack for opcode 0x%02x (vendor pre-amble path)", opcode
-            )
-        else:
-            _LOGGER.warning(
-                "FTMS: Control point response timeout for opcode 0x%02x", opcode
-            )
-        return _CPResult.TIMEOUT
+        _LOGGER.warning("FTMS: Unexpected control point response: %s", resp.hex())
+        return _CPResult.REJECTED
 
     async def _request_control(self) -> bool:
         """Request control of the fitness machine.
@@ -1101,6 +1172,11 @@ class FTMSController:
             )
         return result
 
+    async def _ensure_control_requested(self) -> None:
+        """Send REQUEST_CONTROL once per connection (its result is ignored)."""
+        if not self._has_control:
+            await self._request_control()
+
     async def start(self) -> bool:
         """Start or resume the treadmill belt.
 
@@ -1111,15 +1187,16 @@ class FTMSController:
         BLE connection on KingSmith firmware.
 
         Returns:
-            True if the belt is running. False if the connection was lost.
+            True if the belt is running. False if the connection was lost,
+            START was rejected while the belt is at rest, the belt didn't
+            move in time, or pause() was called meanwhile.
         """
         async with self._op_lock:
             return await self._start_locked()
 
     async def _start_locked(self) -> bool:
         pause_seq = self._pause_seq
-        if not self._has_control:
-            await self._request_control()
+        await self._ensure_control_requested()
 
         if not self.connected:
             _LOGGER.warning("FTMS: Not connected; cannot start")
@@ -1138,7 +1215,7 @@ class FTMSController:
         if accepted:
             _LOGGER.info("FTMS: START_OR_RESUME accepted (cold start)")
             belt_running = await self._wait_for_belt_moving(
-                seq, timeout=15.0, pause_seq=pause_seq
+                seq, timeout=_START_MOTION_TIMEOUT, pause_seq=pause_seq
             )
             if not belt_running:
                 if not self.connected:
@@ -1227,8 +1304,7 @@ class FTMSController:
             unknown — see the log).
         """
         async with self._op_lock:
-            if not self._has_control:
-                await self._request_control()
+            await self._ensure_control_requested()
             if not self._capabilities.pause_before_stop:
                 return await self._send_stop()
 
@@ -1291,12 +1367,7 @@ class FTMSController:
             and self.connected
         ):
             # No ack at all: the session-end event may still be on its way.
-            try:
-                await asyncio.wait_for(
-                    self._session_end_event.wait(), self._session_end_grace
-                )
-            except asyncio.TimeoutError:
-                pass
+            await _wait_event(self._session_end_event, self._session_end_grace)
         # Only a missing ack is overridden by FM Status; an explicit
         # rejection stands.
         if result is _CPResult.TIMEOUT and self._session_end_events != ends_before:
@@ -1383,11 +1454,7 @@ class FTMSController:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return _Standstill.CONFIRMED
-            self._treadmill_data_event.clear()
-            try:
-                await asyncio.wait_for(self._treadmill_data_event.wait(), remaining)
-            except asyncio.TimeoutError:
-                pass
+            await self._wait_for_next_frame(remaining)
 
     async def _wait_for_standstill(self, after_seq: int, timeout: float) -> _Standstill:
         """Wait for a Treadmill Data frame newer than ``after_seq`` with speed 0."""
@@ -1403,11 +1470,7 @@ class FTMSController:
                 if self._treadmill_data_seq == after_seq:
                     return _Standstill.NO_TELEMETRY
                 return _Standstill.STILL_MOVING
-            self._treadmill_data_event.clear()
-            try:
-                await asyncio.wait_for(self._treadmill_data_event.wait(), remaining)
-            except asyncio.TimeoutError:
-                pass
+            await self._wait_for_next_frame(remaining)
 
     async def pause(self) -> bool:
         """Pause the treadmill.
@@ -1418,8 +1481,7 @@ class FTMSController:
         """
         self._pause_seq += 1
         self._treadmill_data_event.set()  # let a waiting start() see it
-        if not self._has_control:
-            await self._request_control()
+        await self._ensure_control_requested()
         return await self._write_control_point(
             FTMSOpcode.STOP_OR_PAUSE,
             bytes([FTMSStopPauseParam.PAUSE]),
@@ -1428,8 +1490,7 @@ class FTMSController:
     async def reset(self) -> bool:
         """Reset the fitness machine."""
         async with self._op_lock:
-            if not self._has_control:
-                await self._request_control()
+            await self._ensure_control_requested()
             return await self._write_control_point(FTMSOpcode.RESET)
 
     async def set_target_speed(self, speed_kmh: float) -> bool:
@@ -1458,8 +1519,7 @@ class FTMSController:
         params = struct.pack("<H", speed_raw)
 
         async with self._op_lock:
-            if not self._has_control:
-                await self._request_control()
+            await self._ensure_control_requested()
 
             _LOGGER.debug(
                 "FTMS: Setting target speed to %.2f km/h (raw: %d)",
@@ -1481,8 +1541,7 @@ class FTMSController:
         params = struct.pack("<h", inclination_raw)
 
         async with self._op_lock:
-            if not self._has_control:
-                await self._request_control()
+            await self._ensure_control_requested()
 
             return await self._write_control_point(
                 FTMSOpcode.SET_TARGET_INCLINATION, params

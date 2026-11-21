@@ -3,8 +3,8 @@
 This module wraps the ph4_walkingpad.pad.Controller to provide the same
 interface as FTMSController, using the unified TreadmillStatus model.
 
-The ph4-walkingpad package is an optional dependency. If not installed,
-importing this module will raise ImportError.
+The ph4-walkingpad package is an optional dependency. If it is not
+installed, creating a WiLinkController raises ImportError.
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ from typing import Callable
 
 from bleak.backends.device import BLEDevice
 
+from ._callbacks import fire_callbacks
+from .const import BeltState
 from .models import TreadmillStatus
 
 _LOGGER = logging.getLogger(__name__)
@@ -94,8 +96,6 @@ class WiLinkController:
 
     def _on_status_update(self, sender, data) -> None:
         """Handle status update from ph4_walkingpad Controller."""
-        from .const import BeltState, OperatingMode
-
         belt_state = (
             data.belt_state
             if data.belt_state in (e.value for e in BeltState)
@@ -115,11 +115,9 @@ class WiLinkController:
             timestamp=time.time(),
         )
 
-        for cb in self._status_callbacks:
-            try:
-                cb(self._status)
-            except Exception:
-                _LOGGER.exception("Error in status callback")
+        fire_callbacks(
+            self._status_callbacks, _LOGGER, "Error in status callback", self._status
+        )
 
     # --- Connection ---
 
@@ -143,8 +141,8 @@ class WiLinkController:
             try:
                 client.set_disconnected_callback(self._on_ble_disconnect)
             except (AttributeError, NotImplementedError):
-                # Bleak removed set_disconnected_callback in a future
-                # release; fall through and rely on `connected` polling.
+                # This client has no (working) set_disconnected_callback;
+                # fall through and rely on `connected` polling.
                 _LOGGER.debug(
                     "WiLink: Bleak set_disconnected_callback unavailable; "
                     "disconnect events will only surface via connected polls"
@@ -154,11 +152,7 @@ class WiLinkController:
         """Handle BLE disconnect from the underlying ph4 BleakClient."""
         _LOGGER.warning("WiLink: BLE link dropped")
         self._connected = False
-        for cb in self._disconnect_callbacks:
-            try:
-                cb()
-            except Exception:
-                _LOGGER.exception("Error in disconnect callback")
+        fire_callbacks(self._disconnect_callbacks, _LOGGER, "Error in disconnect callback")
 
     async def disconnect(self) -> None:
         """Disconnect from the device."""

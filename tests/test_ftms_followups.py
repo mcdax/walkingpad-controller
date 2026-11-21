@@ -415,7 +415,7 @@ def test_first_real_status_event_later_after_subscribe_is_kept() -> None:
 
 def test_status_callbacks_see_the_updated_state() -> None:
     c = FTMSController()
-    c._machine_status_first_event_skipped = True
+    c._machine_status_first_event_seen = True
     seen = []
     c.register_status_callback(lambda st: seen.append((c._paused, st.belt_state)))
     c._on_machine_status(0, bytearray([0x02, 0x02]))
@@ -424,7 +424,7 @@ def test_status_callbacks_see_the_updated_state() -> None:
 
 def test_session_end_at_rest_reports_stopped_without_another_frame() -> None:
     c = FTMSController()
-    c._machine_status_first_event_skipped = True
+    c._machine_status_first_event_seen = True
     c._on_machine_status(0, bytearray([0x02, 0x02]))
     c._on_treadmill_data(0, treadmill_frame(0.0))
     assert c.status.belt_state == BeltState.PAUSED
@@ -437,12 +437,12 @@ def test_disconnect_forgets_speed_and_pause_state() -> None:
     pad.c._client.disconnect = _noop_disconnect(pad)  # type: ignore[union-attr]
     pad.c._on_treadmill_data(0, treadmill_frame(3.0))
     pad.c._paused = True
-    pad.c._machine_status_first_event_skipped = True
+    pad.c._machine_status_first_event_seen = True
     asyncio.run(pad.c.disconnect())
     assert pad.c.status.speed == 0
     assert pad.c.status.belt_state == BeltState.STOPPED
     assert pad.c._paused is False
-    assert pad.c._machine_status_first_event_skipped is False
+    assert pad.c._machine_status_first_event_seen is False
 
 
 def _answering_link(c: FTMSController, answer) -> list[bytes]:
@@ -485,7 +485,7 @@ def test_late_indication_for_another_opcode_is_ignored() -> None:
 def test_preamble_stop_is_not_acknowledged_by_a_pause_event() -> None:
     c = FTMSController()
     c._capabilities.has_vendor_preamble = True
-    c._machine_status_first_event_skipped = True
+    c._machine_status_first_event_seen = True
 
     def answer(data: bytes):
         if data[:1] == bytes([FTMSOpcode.STOP_OR_PAUSE]):
@@ -508,7 +508,7 @@ def test_preamble_stop_is_not_acknowledged_by_a_pause_event() -> None:
 def test_preamble_pause_is_acknowledged_by_a_pause_event() -> None:
     c = FTMSController()
     c._capabilities.has_vendor_preamble = True
-    c._machine_status_first_event_skipped = True
+    c._machine_status_first_event_seen = True
 
     def answer(data: bytes):
         if data[:1] == bytes([FTMSOpcode.STOP_OR_PAUSE]):
@@ -685,12 +685,12 @@ def test_r3_connect_continues_when_telemetry_never_arrives(monkeypatch) -> None:
 
     async def run() -> None:
         await c._subscribe_notifications()
-        c._machine_status_first_event_skipped = True
+        c._machine_status_first_event_seen = True
         await c._ensure_telemetry()
 
     asyncio.run(run())  # silent idle state is not a failed connect
     assert calls["subscribe"] == 2
-    assert c._machine_status_first_event_skipped is False  # replay re-armed
+    assert c._machine_status_first_event_seen is False  # replay re-armed
 
 
 def test_r3_with_flowing_telemetry_does_not_resubscribe(monkeypatch) -> None:

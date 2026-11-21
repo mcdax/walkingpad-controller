@@ -1,8 +1,8 @@
 """Unified WalkingPad treadmill controller with auto protocol detection.
 
 This is the main entry point for controlling WalkingPad/KingSmith treadmills.
-It auto-detects the BLE protocol (FTMS or WiLink) and delegates to the
-appropriate backend.
+It auto-detects the BLE protocol (FTMS, legacy WiLink or Sperax/WLT6200)
+and delegates to the matching backend.
 
 Example usage:
 
@@ -38,6 +38,7 @@ from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 from bleak_retry_connector import establish_connection
 
+from ._callbacks import fire_callbacks
 from .const import (
     FTMS_NAME_PREFIXES,
     FTMS_SERVICE_UUID,
@@ -59,7 +60,7 @@ class WalkingPadController:
     """Unified WalkingPad treadmill controller.
 
     Auto-detects the BLE protocol on first connection and delegates to
-    either FTMSController or WiLinkController.
+    FTMSController, WiLinkController or SperaxController.
 
     Args:
         ble_device: The BLE device to control.
@@ -105,6 +106,14 @@ class WalkingPadController:
         return self._protocol
 
     @property
+    def _backend(self):
+        """The active protocol backend, or None before connecting.
+
+        At most one of the three is set (see `_close_backend`).
+        """
+        return self._ftms or self._wilink or self._sperax
+
+    @property
     def connected(self) -> bool:
         """Whether the device is currently connected.
 
@@ -112,57 +121,32 @@ class WalkingPadController:
         state, not just a cached bool that can drift if the firmware
         unilaterally drops the link before the disconnect callback fires.
         """
-        if self._ftms is not None:
-            return self._ftms.connected
-        if self._wilink is not None:
-            return self._wilink.connected
-        if self._sperax is not None:
-            return self._sperax.connected
-        return self._connected
+        backend = self._backend
+        return backend.connected if backend is not None else self._connected
 
     @property
     def status(self) -> TreadmillStatus:
         """Current treadmill status."""
-        if self._ftms:
-            return self._ftms.status
-        if self._wilink:
-            return self._wilink.status
-        if self._sperax:
-            return self._sperax.status
-        return TreadmillStatus()
+        backend = self._backend
+        return backend.status if backend is not None else TreadmillStatus()
 
     @property
     def min_speed(self) -> float:
         """Minimum speed in km/h."""
-        if self._ftms:
-            return self._ftms.min_speed
-        if self._wilink:
-            return self._wilink.min_speed
-        if self._sperax:
-            return self._sperax.min_speed
-        return 0.5
+        backend = self._backend
+        return backend.min_speed if backend is not None else 0.5
 
     @property
     def max_speed(self) -> float:
         """Maximum speed in km/h."""
-        if self._ftms:
-            return self._ftms.max_speed
-        if self._wilink:
-            return self._wilink.max_speed
-        if self._sperax:
-            return self._sperax.max_speed
-        return 6.0
+        backend = self._backend
+        return backend.max_speed if backend is not None else 6.0
 
     @property
     def speed_increment(self) -> float:
         """Speed increment in km/h."""
-        if self._ftms:
-            return self._ftms.speed_increment
-        if self._wilink:
-            return self._wilink.speed_increment
-        if self._sperax:
-            return self._sperax.speed_increment
-        return 0.1
+        backend = self._backend
+        return backend.speed_increment if backend is not None else 0.1
 
     @property
     def firmware_version(self) -> str:
@@ -183,7 +167,8 @@ class WalkingPadController:
         """Register a callback for status updates.
 
         The callback receives a TreadmillStatus object whenever the device
-        reports new data (via FTMS notifications or WiLink polling).
+        reports new data (FTMS notifications, WiLink polling or Sperax
+        polled status).
         """
         self._status_callbacks.append(callback)
 
@@ -192,22 +177,16 @@ class WalkingPadController:
         self._disconnect_callbacks.append(callback)
 
     def _on_status_update(self, status: TreadmillStatus) -> None:
-        """Internal handler for status updates from either backend."""
-        for cb in self._status_callbacks:
-            try:
-                cb(status)
-            except Exception:
-                _LOGGER.exception("Error in status callback")
+        """Internal handler for status updates from the backend."""
+        fire_callbacks(
+            self._status_callbacks, _LOGGER, "Error in status callback", status
+        )
 
     def _on_disconnect(self) -> None:
-        """Internal handler for disconnect events from either backend."""
+        """Internal handler for disconnect events from the backend."""
         _LOGGER.warning("Device disconnected")
         self._connected = False
-        for cb in self._disconnect_callbacks:
-            try:
-                cb()
-            except Exception:
-                _LOGGER.exception("Error in disconnect callback")
+        fire_callbacks(self._disconnect_callbacks, _LOGGER, "Error in disconnect callback")
 
     # --- Protocol Detection ---
 
@@ -255,9 +234,6 @@ class WalkingPadController:
         elif has_wilink:
             _LOGGER.info("Detected legacy WiLink protocol")
             return ProtocolType.WILINK
-        elif has_ftms:
-            _LOGGER.info("Detected FTMS protocol (with WiLink fallback)")
-            return ProtocolType.FTMS
         elif has_sperax:
             _LOGGER.info("Detected Sperax protocol (service 0xFFF0)")
             return ProtocolType.SPERAX
@@ -329,7 +305,7 @@ class WalkingPadController:
 
     async def _close_backend(self) -> None:
         """Disconnect and forget the current backend, if any."""
-        backend = self._ftms or self._wilink or self._sperax
+        backend = self._backend
         self._ftms = self._wilink = self._sperax = None
         self._connected = False
         if backend is not None:
@@ -341,18 +317,25 @@ class WalkingPadController:
             except Exception:
                 _LOGGER.debug("Error closing previous backend", exc_info=True)
 
-    async def _connect_ftms(self) -> None:
-        """Connect using the FTMS protocol with retry logic."""
+    async def _connect_with_retries(self, label: str, factory, connect):
+        """Connect a fresh backend from ``factory``, retrying failed attempts.
+
+        ``connect(backend)`` performs the backend's connect call. Status
+        callbacks are registered before connecting; disconnect callbacks
+        only once the attempt succeeded, so a failed attempt's link can't
+        report a disconnect later. Returns the connected backend.
+        """
         last_error: Exception | None = None
         for attempt in range(1, MAX_CONNECT_RETRIES + 1):
-            ftms = FTMSController()
-            ftms.register_status_callback(self._on_status_update)
+            backend = factory()
+            backend.register_status_callback(self._on_status_update)
             try:
-                await ftms.connect(self._ble_device, self._name)
+                await connect(backend)
             except (BleakError, TimeoutError) as err:
                 last_error = err
                 _LOGGER.warning(
-                    "FTMS connection attempt %d/%d failed: %s",
+                    "%s connection attempt %d/%d failed: %s",
+                    label,
                     attempt,
                     MAX_CONNECT_RETRIES,
                     err,
@@ -360,20 +343,25 @@ class WalkingPadController:
                 if attempt < MAX_CONNECT_RETRIES:
                     await asyncio.sleep(RETRY_DELAY_SECONDS)
                 continue
-            if not ftms.connected:
+            if not backend.connected:
                 # Dropped between setup and here; close it and retry.
-                await ftms.disconnect()
-                last_error = BleakError("FTMS: link dropped right after connecting")
+                await backend.disconnect()
+                last_error = BleakError(f"{label}: link dropped right after connecting")
                 continue
-            # Register for disconnects only once this attempt succeeded, so
-            # a failed attempt's link can't report a disconnect later.
-            ftms.register_disconnect_callback(self._on_disconnect)
-            self._ftms = ftms
-            return
+            backend.register_disconnect_callback(self._on_disconnect)
+            return backend
         raise last_error  # type: ignore[misc]
 
+    async def _connect_ftms(self) -> None:
+        """Connect using the FTMS protocol with retry logic."""
+        self._ftms = await self._connect_with_retries(
+            "FTMS",
+            FTMSController,
+            lambda ftms: ftms.connect(self._ble_device, self._name),
+        )
+
     async def _connect_wilink(self) -> None:
-        """Connect using the legacy WiLink protocol."""
+        """Connect using the legacy WiLink protocol (no retries)."""
         from .wilink import WiLinkController
 
         self._wilink = WiLinkController()
@@ -385,55 +373,28 @@ class WalkingPadController:
         """Connect using the Sperax / WLT6200 protocol with retry logic."""
         from .sperax import SperaxController
 
-        last_error: Exception | None = None
-        for attempt in range(1, MAX_CONNECT_RETRIES + 1):
-            sperax = SperaxController()
-            sperax.register_status_callback(self._on_status_update)
-            try:
-                await sperax.connect(self._ble_device)
-            except (BleakError, TimeoutError) as err:
-                last_error = err
-                _LOGGER.warning(
-                    "Sperax connection attempt %d/%d failed: %s",
-                    attempt,
-                    MAX_CONNECT_RETRIES,
-                    err,
-                )
-                if attempt < MAX_CONNECT_RETRIES:
-                    await asyncio.sleep(RETRY_DELAY_SECONDS)
-                continue
-            if not sperax.connected:
-                await sperax.disconnect()
-                last_error = BleakError("Sperax: link dropped right after connecting")
-                continue
-            sperax.register_disconnect_callback(self._on_disconnect)
-            self._sperax = sperax
-            return
-        raise last_error  # type: ignore[misc]
+        self._sperax = await self._connect_with_retries(
+            "Sperax",
+            SperaxController,
+            lambda sperax: sperax.connect(self._ble_device),
+        )
 
     async def disconnect(self) -> None:
         """Disconnect from the device.
 
-        Always tear down a live backend if one exists — relying solely on
-        the cached ``_connected`` flag misses the case where the firmware
-        unilaterally dropped the link (so our callback flipped the cache
-        to False) but Bleak still holds an open client we need to close.
+        Tears down the backend whenever either the cached ``_connected`` flag
+        or the backend itself says the link is up. Relying on the flag alone
+        misses the case where the firmware dropped the link (so our callback
+        cleared the flag) but Bleak still holds an open client to close.
         """
         async with self._lock:
-            backend_alive = (
-                (self._ftms is not None and self._ftms.connected)
-                or (self._wilink is not None and self._wilink.connected)
-                or (self._sperax is not None and self._sperax.connected)
-            )
+            backend = self._backend
+            backend_alive = backend is not None and backend.connected
             if not self._connected and not backend_alive:
                 return
             try:
-                if self._ftms:
-                    await self._ftms.disconnect()
-                elif self._wilink:
-                    await self._wilink.disconnect()
-                elif self._sperax:
-                    await self._sperax.disconnect()
+                if backend is not None:
+                    await backend.disconnect()
             except Exception:
                 _LOGGER.exception("Error during disconnect")
             finally:
@@ -450,19 +411,17 @@ class WalkingPadController:
         slider).  Sending a speed command during motor spin-up crashes
         the BLE connection on KingSmith firmware.
 
-        For WiLink devices, sends the standard start command.
+        For WiLink devices, sends the standard start command. Sperax resumes
+        at the cached target speed (at least the minimum).
 
         Returns:
-            True if the belt is running. False if the connection was lost.
+            True if the belt is running (FTMS) or the command was sent.
+            False on a lost connection, timeout, rejection or a pause
+            during spin-up.
         """
-        if self._ftms:
-            return await self._ftms.start()
-
-        elif self._wilink:
-            return await self._wilink.start()
-
-        elif self._sperax:
-            return await self._sperax.start()
+        backend = self._backend
+        if backend is not None:
+            return await backend.start()
 
         _LOGGER.warning("No protocol backend available")
         return False
@@ -481,12 +440,9 @@ class WalkingPadController:
         Returns:
             True if the command was sent successfully.
         """
-        if self._ftms:
-            return await self._ftms.stop()
-        elif self._wilink:
-            return await self._wilink.stop()
-        elif self._sperax:
-            return await self._sperax.stop()
+        backend = self._backend
+        if backend is not None:
+            return await backend.stop()
 
         _LOGGER.warning("No protocol backend available")
         return False
@@ -514,8 +470,7 @@ class WalkingPadController:
             )
             return await self._wilink.stop()
         elif self._sperax:
-            # Sperax has no separate pause opcode; the backend falls back to
-            # stop internally and logs it.
+            # Sperax has its own pause state (counters kept).
             return await self._sperax.pause()
 
         _LOGGER.warning("No protocol backend available")
@@ -524,10 +479,10 @@ class WalkingPadController:
     async def set_speed(self, speed_kmh: float) -> bool:
         """Set the treadmill speed.
 
-        If the belt is already running, sends SET_TARGET_SPEED directly.
-        If the belt is stopped, starts it first (the belt will run at
-        minimum speed until the user adjusts the speed slider). A speed of
-        0 or less pauses a running belt and leaves a stopped one alone.
+        A speed of 0 or less always asks the belt to pause and never starts
+        it. Otherwise, per protocol: FTMS sends SET_TARGET_SPEED directly if
+        the belt runs, else starts it, waits for motion, then sets the speed;
+        WiLink and Sperax send the speed directly.
 
         Args:
             speed_kmh: Target speed in km/h.
@@ -578,11 +533,11 @@ class WalkingPadController:
     async def set_incline(self, incline_step: int) -> bool:
         """Set the incline as a discrete step.
 
-        Only the Sperax / WLT6200 backend supports incline today (steps 0-2).
+        Only the Sperax / WLT6200 backend supports incline today (steps 0-10).
         FTMS/WiLink backends return False.
 
         Args:
-            incline_step: Incline step (0-2).
+            incline_step: Incline step (0-10).
 
         Returns:
             True if the command was sent successfully.
@@ -643,23 +598,20 @@ class WalkingPadController:
     async def update_state(self) -> None:
         """Request current state from the device.
 
-        For FTMS devices, status is pushed via notifications so this
-        fires a synthetic update from cached data. For WiLink devices,
-        this polls the device.
+        For FTMS and Sperax devices, status is pushed (notifications / the
+        poll loop), so this fires a synthetic update from cached data. For
+        WiLink devices, this polls the device.
         """
-        if self._ftms:
-            if self._ftms.connected:
-                self._on_status_update(self._ftms.status)
-            else:
-                self._connected = False
-        elif self._wilink:
+        if self._wilink:
             await self._wilink.ask_stats()
-        elif self._sperax:
-            # Status is pushed via the poll loop; surface the latest cache.
-            if self._sperax.connected:
-                self._on_status_update(self._sperax.status)
-            else:
-                self._connected = False
+            return
+        backend = self._backend
+        if backend is None:
+            return
+        if backend.connected:
+            self._on_status_update(backend.status)
+        else:
+            self._connected = False
 
     def update_ble_device(self, ble_device: BLEDevice) -> None:
         """Update the BLE device reference (e.g., after rediscovery).
