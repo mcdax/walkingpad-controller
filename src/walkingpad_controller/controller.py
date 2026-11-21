@@ -333,6 +333,9 @@ class WalkingPadController:
         self._ftms = self._wilink = self._sperax = None
         self._connected = False
         if backend is not None:
+            # Bleak reports explicit disconnects too; the old backend must
+            # not tell our users that the new link dropped.
+            backend._disconnect_callbacks.clear()
             try:
                 await backend.disconnect()
             except Exception:
@@ -357,13 +360,15 @@ class WalkingPadController:
                 if attempt < MAX_CONNECT_RETRIES:
                     await asyncio.sleep(RETRY_DELAY_SECONDS)
                 continue
+            if not ftms.connected:
+                # Dropped between setup and here; close it and retry.
+                await ftms.disconnect()
+                last_error = BleakError("FTMS: link dropped right after connecting")
+                continue
             # Register for disconnects only once this attempt succeeded, so
             # a failed attempt's link can't report a disconnect later.
             ftms.register_disconnect_callback(self._on_disconnect)
             self._ftms = ftms
-            if not ftms.connected:
-                self._ftms = None
-                raise BleakError("FTMS: link dropped right after connecting")
             return
         raise last_error  # type: ignore[misc]
 
@@ -397,11 +402,12 @@ class WalkingPadController:
                 if attempt < MAX_CONNECT_RETRIES:
                     await asyncio.sleep(RETRY_DELAY_SECONDS)
                 continue
+            if not sperax.connected:
+                await sperax.disconnect()
+                last_error = BleakError("Sperax: link dropped right after connecting")
+                continue
             sperax.register_disconnect_callback(self._on_disconnect)
             self._sperax = sperax
-            if not sperax.connected:
-                self._sperax = None
-                raise BleakError("Sperax: link dropped right after connecting")
             return
         raise last_error  # type: ignore[misc]
 
@@ -532,9 +538,10 @@ class WalkingPadController:
         if speed_kmh <= 0:
             # 0 km/h means "halt", not "minimum speed" — and must never
             # start a stopped belt.
-            if self.status.speed > 0:
-                return await self.pause()
-            return True
+            # The cached speed can be stale (e.g. 0 right after a reconnect),
+            # so always ask the belt to pause; a stopped belt may reject it.
+            paused = await self.pause()
+            return paused or self.status.speed == 0
 
         if self._ftms:
             if self._ftms.status.speed > 0 and not self._ftms._paused:

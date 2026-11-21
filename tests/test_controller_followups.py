@@ -96,8 +96,9 @@ def _controller_with(pad: Pad) -> WalkingPadController:
 
 def test_set_speed_zero_does_not_start_a_stopped_belt() -> None:
     pad = Pad(pause_before_stop=False, speed=0.0)
+    pad.on_pause = []
     assert asyncio.run(_controller_with(pad).set_speed(0)) is True
-    assert pad.sent == []
+    assert FTMSOpcode.START_OR_RESUME not in [op for op, _ in pad.sent]
 
 
 def test_set_speed_zero_pauses_a_running_belt() -> None:
@@ -124,3 +125,22 @@ def test_set_speed_while_decelerating_after_pause_takes_the_start_path() -> None
 def test_operating_mode_compares_with_the_int_status_mode() -> None:
     assert OperatingMode.MANUAL == 1
     assert OperatingMode(1) is OperatingMode.MANUAL
+
+
+def test_closed_backend_cannot_report_a_disconnect(monkeypatch) -> None:
+    connects: list[FTMSController] = []
+
+    async def connect(self, ble_device, name=None):
+        connects.append(self)
+        self._client = FakeClient()
+        self._connected = True
+
+    monkeypatch.setattr(FTMSController, "connect", connect)
+    wp = WalkingPadController(DEVICE)  # type: ignore[arg-type]
+    asyncio.run(wp.connect())
+    wp._ftms._client.is_connected = False  # type: ignore[union-attr]
+    asyncio.run(wp.connect())  # stale flag: closes the old backend
+    lost: list[bool] = []
+    wp.register_disconnect_callback(lambda: lost.append(True))
+    connects[0]._on_disconnect(None)  # Bleak reports the old link closing
+    assert lost == [] and wp.connected

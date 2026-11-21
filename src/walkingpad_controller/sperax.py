@@ -208,6 +208,9 @@ class SperaxController:
         # then a running belt's speed (e.g. started from the remote) is
         # adopted, so an incline change doesn't snap it to a stale target.
         self._speed_from_us = False
+        # Set once the disconnect callbacks fired for the current link, so a
+        # poll give-up and Bleak's own callback don't both report it.
+        self._disconnect_reported = False
 
     # --- Properties ---
 
@@ -282,6 +285,7 @@ class SperaxController:
             disconnected_callback=self._on_disconnect,
         )
         self._connected = True
+        self._disconnect_reported = False
         _LOGGER.info("Sperax: Connected to %s", ble_device.address)
 
         try:
@@ -321,6 +325,13 @@ class SperaxController:
         self._synced_from_device = False
         self._device_state = None
         self._stop_poll()
+        self._report_disconnect()
+
+    def _report_disconnect(self) -> None:
+        """Fire the disconnect callbacks once per connection."""
+        if self._disconnect_reported:
+            return
+        self._disconnect_reported = True
         for cb in self._disconnect_callbacks:
             try:
                 cb()
@@ -382,17 +393,13 @@ class SperaxController:
         self._connected = False
         self._synced_from_device = False
         self._device_state = None
+        if was_connected:
+            self._report_disconnect()
         if client is not None and client.is_connected:
             try:
                 await client.disconnect()
-            except (BleakError, TimeoutError):
-                pass
-        if was_connected:
-            for cb in self._disconnect_callbacks:
-                try:
-                    cb()
-                except Exception:
-                    _LOGGER.exception("Error in disconnect callback")
+            except Exception as err:
+                _LOGGER.debug("Sperax: error closing dead link: %s", err)
 
     # --- Write helper ---
 
@@ -441,13 +448,17 @@ class SperaxController:
         speed_raw = inner[15]
         self._device_state = inner[4]
         self._status.speed = speed_raw / 10.0
+        if inner[4] == _STATUS_STATE_RUNNING and speed_raw > 0:
+            self._paused = False  # resumed, e.g. from the remote
+        elif inner[4] == _STATUS_STATE_IDLE:
+            self._paused = False  # session ended on the device
         if speed_raw > 0:
             self._status.belt_state = BeltState.ACTIVE
         elif self._paused:
             self._status.belt_state = BeltState.PAUSED
         else:
             self._status.belt_state = BeltState.STOPPED
-        if inner[4] == _STATUS_STATE_IDLE and not self._paused:
+        if inner[4] == _STATUS_STATE_IDLE:
             # No session: the next start() begins at the minimum speed
             # instead of the previous session's target.
             self._target_speed_tenths = int(round(self.min_speed * 10))
@@ -457,6 +468,8 @@ class SperaxController:
             and speed_raw > 0
             and not self._speed_from_us
         ):
+            # Known limitation: once we set a speed, a later change from the
+            # remote is not adopted, so the next incline change restores ours.
             self._target_speed_tenths = speed_raw
 
         # The vibration-level field (offset 18) holds the *last selected*
@@ -564,7 +577,10 @@ class SperaxController:
         try:
             await self._write(bytes([0x00, _CMD_RUN, _RUN_STATE_PAUSE, 0x00, 0x00]))
             self._synced_from_device = True
-            self._paused = True
+            # Pausing an idle belt doesn't create a paused session.
+            self._paused = (
+                self._status.speed > 0 or self._device_state == _STATUS_STATE_RUNNING
+            )
             self._device_state = None
             return True
         except BleakError as err:

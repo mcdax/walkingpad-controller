@@ -59,7 +59,7 @@ _LOGGER = logging.getLogger(__name__)
 
 # A first 0x2ADA event later than this after subscribing is a real event,
 # not the firmware's replay of its previous state.
-_STATUS_REPLAY_WINDOW = 1.0
+_STATUS_REPLAY_WINDOW = 2.0
 
 
 # Mapping from FTMS Control Point opcode to the Fitness Machine Status (2ADA)
@@ -523,15 +523,22 @@ class FTMSController:
         # caller retries) instead of leaving a half-working link.
         subscriptions = (
             (TREADMILL_DATA_UUID, self._on_treadmill_data, "Treadmill Data", 0.10, True),
-            (FITNESS_MACHINE_STATUS_UUID, self._on_machine_status, "Fitness Machine Status", 0.20, False),
+            # On the vendor pre-amble path FM Status is the only ack channel.
+            (
+                FITNESS_MACHINE_STATUS_UUID,
+                self._on_machine_status,
+                "Fitness Machine Status",
+                0.20,
+                self._capabilities.has_vendor_preamble,
+            ),
             (FTMS_CONTROL_POINT_UUID, self._on_control_point_response, "Control Point", 0.0, True),
         )
 
         for uuid, handler, label, delay_after, required in subscriptions:
             try:
+                await self._client.start_notify(uuid, handler)
                 if uuid == FITNESS_MACHINE_STATUS_UUID:
                     self._status_subscribed_at = time.monotonic()
-                await self._client.start_notify(uuid, handler)
                 _LOGGER.debug("FTMS: Subscribed to %s", label)
             except Exception as err:
                 if required:
@@ -546,9 +553,9 @@ class FTMSController:
         """Make sure notifications flow; resubscribe once if they don't.
 
         Only used on devices known to stream Treadmill Data while idle (the
-        R3), so silence means the subscription was dropped, not an idle belt.
-        Raises BleakError if nothing arrives after resubscribing, so the
-        caller retries with a fresh connection.
+        R3), so silence usually means the subscription was dropped. If
+        nothing arrives after resubscribing either, log and carry on: the
+        belt may be in a silent idle state, and the Control Point still works.
         """
         for attempt in range(2):
             if await self._wait_for_frame(self._telemetry_check_timeout):
@@ -570,8 +577,12 @@ class FTMSController:
                         await self._client.stop_notify(uuid)
                     except Exception as err:
                         _LOGGER.debug("FTMS: stop_notify %s failed: %s", uuid, err)
+                # The resubscribe triggers a fresh 0x2ADA replay; drop it too.
+                self._machine_status_first_event_skipped = False
                 await self._subscribe_notifications()
-        raise BleakError("FTMS: no Treadmill Data after resubscribing")
+        _LOGGER.warning(
+            "FTMS: still no Treadmill Data after resubscribing; continuing"
+        )
 
     async def _wait_for_frame(self, timeout: float) -> bool:
         """Wait for any Treadmill Data frame; False on timeout or disconnect."""
@@ -1272,7 +1283,11 @@ class FTMSController:
             )
             return True
         # Pre-amble firmware often applies commands without any ack.
-        return result is _CPResult.TIMEOUT and self._capabilities.has_vendor_preamble
+        return (
+            result is _CPResult.TIMEOUT
+            and self._capabilities.has_vendor_preamble
+            and self.connected
+        )
 
     async def _pause_until_standstill(self) -> bool:
         """Send PAUSE and wait for fresh telemetry to confirm 0 km/h.

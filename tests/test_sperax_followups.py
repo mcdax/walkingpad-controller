@@ -117,3 +117,44 @@ def test_explicit_speed_is_not_overridden_while_ramping() -> None:
     asyncio.run(ctrl.set_target_speed(5.0))
     ctrl._parse_status(status(22))  # ramping up towards 5.0
     assert ctrl._target_speed_tenths == 50
+
+
+def test_pausing_an_idle_belt_does_not_read_paused() -> None:
+    ctrl = SperaxController()
+    offline(ctrl)
+    ctrl._parse_status(status(0, state=0x01))
+    asyncio.run(ctrl.pause())
+    ctrl._parse_status(status(0, state=0x01))
+    assert ctrl.status.belt_state == BeltState.STOPPED
+
+
+def test_remote_resume_and_device_idle_clear_paused() -> None:
+    ctrl = SperaxController()
+    offline(ctrl)
+    ctrl._parse_status(status(30))
+    asyncio.run(ctrl.pause())
+    ctrl._parse_status(status(25))  # resumed from the remote
+    ctrl._parse_status(status(0, state=0x01))
+    assert ctrl.status.belt_state == BeltState.STOPPED
+
+
+def test_poll_give_up_and_bleak_callback_report_once(monkeypatch) -> None:
+    monkeypatch.setattr(sperax_mod, "_POLL_INTERVAL", 0)
+    ctrl = SperaxController()
+
+    async def write_gatt_char(*args, **kwargs):
+        raise TimeoutError
+
+    async def disconnect():
+        client.is_connected = False
+        ctrl._on_disconnect(client)  # Bleak fires its callback as well
+
+    client = SimpleNamespace(
+        is_connected=True, write_gatt_char=write_gatt_char, disconnect=disconnect
+    )
+    ctrl._client = client  # type: ignore[assignment]
+    ctrl._connected = True
+    lost: list[bool] = []
+    ctrl.register_disconnect_callback(lambda: lost.append(True))
+    asyncio.run(asyncio.wait_for(ctrl._poll_loop(), 1.0))
+    assert lost == [True]

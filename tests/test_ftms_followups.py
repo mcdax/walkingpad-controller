@@ -676,21 +676,21 @@ def test_r3_resubscribes_when_no_telemetry_arrives(monkeypatch) -> None:
     assert calls["subscribe"] == 2 and calls["stop"] == 3
 
 
-def test_r3_connect_fails_when_telemetry_never_arrives(monkeypatch) -> None:
-    from bleak.exc import BleakError
-
+def test_r3_connect_continues_when_telemetry_never_arrives(monkeypatch) -> None:
     from walkingpad_controller import ftms
 
     monkeypatch.setattr(ftms.asyncio, "sleep", _no_sleep)
     c = FTMSController()
-    _r3_link(c, deliver_after_subscribes=None)
+    calls = _r3_link(c, deliver_after_subscribes=None)
 
     async def run() -> None:
         await c._subscribe_notifications()
+        c._machine_status_first_event_skipped = True
         await c._ensure_telemetry()
 
-    with pytest.raises(BleakError):
-        asyncio.run(run())
+    asyncio.run(run())  # silent idle state is not a failed connect
+    assert calls["subscribe"] == 2
+    assert c._machine_status_first_event_skipped is False  # replay re-armed
 
 
 def test_r3_with_flowing_telemetry_does_not_resubscribe(monkeypatch) -> None:
