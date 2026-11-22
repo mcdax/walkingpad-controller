@@ -184,6 +184,9 @@ Multi-step commands (`start`, `stop`, `set_speed`, …) are serialised within a 
 ### BLE Connection Drops
 KingSmith FTMS devices may occasionally drop the connection, typically around a cold start. The library does not reconnect or replay commands on its own: call `connect()` again (Home Assistant's integration does this) and re-send the speed if needed. After a reconnect the cached speed is reset to 0 until fresh telemetry arrives.
 
+### Remote Control and ESPHome Bluetooth Proxies
+ESPHome Bluetooth proxies (as used by Home Assistant) keep the link at an 8.75-11.25 ms connection interval. At that interval the KS-HD-Z1D ignores its own remote control while connected. When connected through such a proxy, the library asks for 30-50 ms (the BlueZ default) right after connecting; the remote then keeps working. Older proxy firmware without this feature ignores the request.
+
 ### Connection Exclusivity
 Only one BLE client can connect to the treadmill at a time — KS Fit and any client of this library are mutually exclusive.
 

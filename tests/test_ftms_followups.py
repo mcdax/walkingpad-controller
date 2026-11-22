@@ -970,3 +970,30 @@ def test_halt_during_request_control_drops_the_start() -> None:
     assert asyncio.run(run()) is False
     assert bytes([FTMSOpcode.START_OR_RESUME]) not in writes
     assert bytes([FTMSOpcode.REQUEST_CONTROL]) in writes
+
+
+def test_esphome_proxy_gets_a_relaxed_connection_interval() -> None:
+    # ESPHome proxies keep ~10 ms; the KS-HD-Z1D then ignores its remote.
+    calls: list[tuple[int, int, int, int]] = []
+
+    class Backend:
+        async def set_connection_params(self, *args) -> None:
+            calls.append(args)
+
+    c = FTMSController()
+    c._client = SimpleNamespace(_backend=Backend())  # type: ignore[assignment]
+    asyncio.run(c._relax_connection_interval())
+    assert calls == [(24, 40, 0, 400)]
+
+
+def test_other_backends_and_failures_are_left_alone() -> None:
+    c = FTMSController()
+    c._client = SimpleNamespace(_backend=SimpleNamespace())  # type: ignore[assignment]
+    asyncio.run(c._relax_connection_interval())  # BlueZ: no such method
+
+    class Failing:
+        async def set_connection_params(self, *args) -> None:
+            raise RuntimeError("old proxy firmware")
+
+    c._client = SimpleNamespace(_backend=Failing())  # type: ignore[assignment]
+    asyncio.run(c._relax_connection_interval())  # not fatal
