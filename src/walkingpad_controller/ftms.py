@@ -1056,13 +1056,15 @@ class FTMSController:
                     return _CPResult.NOT_SENT
                 if opcode != FTMSOpcode.REQUEST_CONTROL and not self._has_control:
                     await self._request_control_locked()
-                result = await self._write_and_wait(opcode, params, timeout)
-                if opcode == FTMSOpcode.RESET and result is not _CPResult.REJECTED:
+                if opcode == FTMSOpcode.RESET:
                     # A Reset revokes control (FTMS spec; the KS-HD-Z1D then
-                    # answers nothing). Also on a missing ack: the device may
-                    # have reset anyway.
+                    # answers nothing). Drop it before writing, so a lost ack,
+                    # an error or a cancellation can't leave it set; after a
+                    # rejected RESET this only costs one extra REQUEST_CONTROL.
                     self._has_control = False
-                return result
+                return await self._write_and_wait(
+                    opcode, params, timeout, halt_seq=halt_seq
+                )
             finally:
                 # Always clear the expectation, also on error or cancellation.
                 self._status_ack_expected_opcode = None
@@ -1070,7 +1072,12 @@ class FTMSController:
                 self._cp_pending_opcode = None
 
     async def _write_and_wait(
-        self, opcode: FTMSOpcode, params: bytes, timeout: float
+        self,
+        opcode: FTMSOpcode,
+        params: bytes,
+        timeout: float,
+        *,
+        halt_seq: int | None = None,
     ) -> _CPResult:
         """Body of `_write_control_point_result`; caller holds `_cp_lock`."""
         if not self.connected:
@@ -1081,6 +1088,15 @@ class FTMSController:
 
         if self._capabilities.has_vendor_preamble:
             await self._write_vendor_preamble(client)
+            # The pre-amble write is a suspension point: re-check right
+            # before the Control Point write.
+            if halt_seq is not None and self._pause_seq != halt_seq:
+                _LOGGER.info(
+                    "FTMS: Halt requested; not sending opcode 0x%02x", opcode
+                )
+                return _CPResult.NOT_SENT
+            if not self.connected:
+                return _CPResult.NOT_SENT
         expected_status_opcode = self._arm_status_ack(opcode, params)
         self._note_cp_command(opcode, params)
 
@@ -1675,6 +1691,9 @@ class FTMSController:
         (start() waits for standstill). A pause()/stop() requested after
         this call cancels it.
         """
+        if speed_kmh <= 0:
+            # 0 km/h means "halt", never "start at minimum speed".
+            return await self.pause()
         halt_seq = self._pause_seq
         async with self._op_lock:
             if self._pause_seq != halt_seq:

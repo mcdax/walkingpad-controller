@@ -66,7 +66,7 @@ class Pad:
         # serialisation, halt check and control re-request run.
         self.c._write_and_wait = self._write_and_wait  # type: ignore[method-assign]
 
-    async def _write_and_wait(self, opcode, params, timeout) -> _CPResult:
+    async def _write_and_wait(self, opcode, params, timeout, **kwargs) -> _CPResult:
         return await self._write_result(opcode, params)
 
     async def _write_result(self, opcode, params=b"", *args, **kwargs) -> _CPResult:
@@ -464,3 +464,10 @@ def test_pause_cancels_a_pending_speed_change() -> None:
 
     assert asyncio.run(run()) is False
     assert not _speed_cmds(pad)
+
+
+def test_backend_set_speed_zero_pauses_and_never_starts() -> None:
+    pad = Pad(pause_before_stop=False, speed=0.0)
+    pad.on_pause = []
+    asyncio.run(pad.c.set_speed(0))
+    assert pad.sent == [PAUSE]

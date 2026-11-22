@@ -102,7 +102,7 @@ def _timed_out_stop_pad(*, session_end_after: float | None) -> Pad:
             )
         return _CPResult.TIMEOUT
 
-    pad.c._write_and_wait = lambda op, params, timeout: write(op, params)  # type: ignore[method-assign,assignment]
+    pad.c._write_and_wait = lambda op, params, timeout, **kw: write(op, params)  # type: ignore[method-assign,assignment]
     return pad
 
 
@@ -385,7 +385,7 @@ def test_pause_during_request_control_abandons_start() -> None:
             pad.c._pause_seq += 1  # pause() lands while REQUEST_CONTROL is in flight
         return await pad._write_result(opcode, params)
 
-    pad.c._write_and_wait = lambda op, params, timeout: write(op, params)  # type: ignore[method-assign,assignment]
+    pad.c._write_and_wait = lambda op, params, timeout, **kw: write(op, params)  # type: ignore[method-assign,assignment]
     assert asyncio.run(pad.c.start()) is False
     assert FTMSOpcode.START_OR_RESUME not in [op for op, _ in pad.sent]
 
@@ -848,3 +848,67 @@ def test_preamble_first_event_must_match_the_pending_param() -> None:
     c._on_machine_status(0, bytearray([0x02, 0x01]))
     assert c._paused is True  # replay dropped, not applied as session end
     assert not c._status_ack_event.is_set()
+
+
+class _GatedClient:
+    """Fake Bleak client; the vendor pre-amble write blocks on a gate."""
+
+    def __init__(self, c: FTMSController) -> None:
+        self.c = c
+        self.is_connected = True
+        self.gate = asyncio.Event()
+        self.writes: list[bytes] = []
+
+    async def write_gatt_char(self, uuid, data, response=True) -> None:
+        from walkingpad_controller.const import KINGSMITH_VENDOR_PREAMBLE_UUID
+
+        if uuid == KINGSMITH_VENDOR_PREAMBLE_UUID:
+            await self.gate.wait()
+            return
+        self.writes.append(bytes(data))
+        # Ack every Control Point write with success.
+        self.c._on_control_point_response(0, bytearray([0x80, data[0], 0x01]))
+
+
+def test_halt_during_the_vendor_preamble_drops_the_start() -> None:
+    # MC-21 path: START passed the first halt check, then waits in the
+    # pre-amble write while stop() is requested.
+    c = FTMSController()
+    c._connected = True
+    c._has_control = True
+    c._capabilities.has_vendor_preamble = True
+    client = _GatedClient(c)
+    c._client = client  # type: ignore[assignment]
+
+    async def run() -> bool:
+        start = asyncio.create_task(c.start())
+        await asyncio.sleep(0.01)  # START is waiting in the pre-amble
+        c._note_halt()
+        client.gate.set()
+        return await start
+
+    assert asyncio.run(run()) is False
+    assert bytes([FTMSOpcode.START_OR_RESUME]) not in client.writes
+
+
+def test_reset_cancelled_during_its_ack_still_drops_control() -> None:
+    pad = Pad(pause_before_stop=False, speed=0.0)
+    gate = asyncio.Event()
+    inner = pad._write_result
+
+    async def write(opcode, params=b"", *args, **kwargs):
+        if opcode == FTMSOpcode.RESET:
+            pad.sent.append((opcode, bytes(params)))
+            await gate.wait()  # never released: the caller gives up
+        return await inner(opcode, params)
+
+    pad._write_result = write  # type: ignore[method-assign]
+
+    async def run() -> None:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(pad.c.reset(), 0.02)
+        await pad.c.pause()
+
+    asyncio.run(run())
+    ops = [op for op, _ in pad.sent]
+    assert ops == [FTMSOpcode.RESET, FTMSOpcode.REQUEST_CONTROL, FTMSOpcode.STOP_OR_PAUSE]
