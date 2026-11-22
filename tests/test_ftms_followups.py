@@ -7,12 +7,13 @@ cancellation, fresh-telemetry start, and pause() while start() waits.
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from walkingpad_controller import FTMSController
-from walkingpad_controller.const import BeltState, FTMSOpcode
+from walkingpad_controller.const import BeltState, FTMSOpcode, FTMSStopPauseParam
 from walkingpad_controller.ftms import _CPResult, _needs_pause_before_stop
 
 from test_ftms_stop import FRAME_GAP, PAUSE, STOP, Pad, treadmill_frame
@@ -760,3 +761,29 @@ def test_subscription_table_matches_the_resubscribe_list(monkeypatch) -> None:
     c._client = SimpleNamespace(is_connected=True, start_notify=start_notify)  # type: ignore[assignment]
     asyncio.run(c._subscribe_notifications())
     assert tuple(order) == ftms._CONNECT_SUBSCRIPTION_UUIDS
+
+
+def test_first_status_event_answering_a_command_right_after_connect_is_kept() -> None:
+    # KS-HD-Z1D (no pre-amble): PAUSE sent ~2 s after subscribing; its
+    # 02 02 is the first 2ADA event and must not be dropped as a replay.
+    c = FTMSController()
+    c._status_subscribed_at = time.monotonic()
+    c._note_cp_command(FTMSOpcode.STOP_OR_PAUSE, bytes([FTMSStopPauseParam.PAUSE]))
+    c._on_machine_status(0, bytearray([0x02, 0x02]))
+    assert c._paused is True
+
+
+def test_first_status_event_not_matching_the_command_is_still_a_replay() -> None:
+    c = FTMSController()
+    c._status_subscribed_at = time.monotonic()
+    c._note_cp_command(FTMSOpcode.STOP_OR_PAUSE, bytes([FTMSStopPauseParam.PAUSE]))
+    c._on_machine_status(0, bytearray([0x02, 0x01]))  # stale STOP replay
+    assert c._paused is False
+    assert c._machine_status_first_event_seen is True
+
+
+def test_first_status_event_without_a_command_is_still_a_replay() -> None:
+    c = FTMSController()
+    c._status_subscribed_at = time.monotonic()
+    c._on_machine_status(0, bytearray([0x02, 0x02]))
+    assert c._paused is False
