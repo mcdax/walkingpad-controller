@@ -1206,6 +1206,7 @@ class FTMSController:
             return False
 
         seq = self._treadmill_data_seq
+        kind = "resume" if self._status.belt_state == BeltState.PAUSED else "cold start"
         accepted = await self._write_control_point(FTMSOpcode.START_OR_RESUME)
 
         if not self.connected:
@@ -1213,7 +1214,7 @@ class FTMSController:
             return False
 
         if accepted:
-            _LOGGER.info("FTMS: START_OR_RESUME accepted (cold start)")
+            _LOGGER.info("FTMS: START_OR_RESUME accepted (%s)", kind)
             belt_running = await self._wait_for_belt_moving(
                 seq, timeout=_START_MOTION_TIMEOUT, pause_seq=pause_seq
             )
@@ -1227,7 +1228,8 @@ class FTMSController:
                 _LOGGER.warning("FTMS: Belt did not start moving within timeout")
                 return False
             _LOGGER.info(
-                "FTMS: Cold start complete — belt running at %.1f km/h",
+                "FTMS: %s complete — belt running at %.1f km/h",
+                kind.capitalize(),
                 self._status.speed,
             )
             return True
