@@ -1086,10 +1086,14 @@ class FTMSController:
         client = self._client
         assert client is not None
 
+        # Re-check the halt here, not only before the lock: a REQUEST_CONTROL
+        # sent just before (and the pre-amble write below) are suspension
+        # points.
+        if halt_seq is not None and self._pause_seq != halt_seq:
+            _LOGGER.info("FTMS: Halt requested; not sending opcode 0x%02x", opcode)
+            return _CPResult.NOT_SENT
         if self._capabilities.has_vendor_preamble:
             await self._write_vendor_preamble(client)
-            # The pre-amble write is a suspension point: re-check right
-            # before the Control Point write.
             if halt_seq is not None and self._pause_seq != halt_seq:
                 _LOGGER.info(
                     "FTMS: Halt requested; not sending opcode 0x%02x", opcode

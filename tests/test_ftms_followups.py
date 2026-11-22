@@ -851,20 +851,31 @@ def test_preamble_first_event_must_match_the_pending_param() -> None:
 
 
 class _GatedClient:
-    """Fake Bleak client; the vendor pre-amble write blocks on a gate."""
+    """Fake Bleak client; a chosen write blocks on a gate.
 
-    def __init__(self, c: FTMSController) -> None:
+    ``gate_on`` is "preamble" (the vendor pre-amble write) or a Control
+    Point opcode. ``entered`` is set once the gated write is reached.
+    """
+
+    def __init__(self, c: FTMSController, gate_on="preamble") -> None:
         self.c = c
         self.is_connected = True
         self.gate = asyncio.Event()
+        self.entered = asyncio.Event()
+        self.gate_on = gate_on
         self.writes: list[bytes] = []
 
     async def write_gatt_char(self, uuid, data, response=True) -> None:
         from walkingpad_controller.const import KINGSMITH_VENDOR_PREAMBLE_UUID
 
         if uuid == KINGSMITH_VENDOR_PREAMBLE_UUID:
-            await self.gate.wait()
+            if self.gate_on == "preamble":
+                self.entered.set()
+                await self.gate.wait()
             return
+        if self.gate_on == data[0]:
+            self.entered.set()
+            await self.gate.wait()
         self.writes.append(bytes(data))
         # Ack every Control Point write with success.
         self.c._on_control_point_response(0, bytearray([0x80, data[0], 0x01]))
@@ -882,7 +893,7 @@ def test_halt_during_the_vendor_preamble_drops_the_start() -> None:
 
     async def run() -> bool:
         start = asyncio.create_task(c.start())
-        await asyncio.sleep(0.01)  # START is waiting in the pre-amble
+        await client.entered.wait()  # START is waiting in the pre-amble
         c._note_halt()
         client.gate.set()
         return await start
@@ -912,3 +923,50 @@ def test_reset_cancelled_during_its_ack_still_drops_control() -> None:
     asyncio.run(run())
     ops = [op for op, _ in pad.sent]
     assert ops == [FTMSOpcode.RESET, FTMSOpcode.REQUEST_CONTROL, FTMSOpcode.STOP_OR_PAUSE]
+
+
+def test_halt_during_request_control_drops_the_start() -> None:
+    # No pre-amble. START passes its control check while another write holds
+    # the CP lock; a RESET queued ahead of it drops control, so the write path
+    # sends REQUEST_CONTROL before START. A stop() during that must drop START.
+    c = FTMSController()
+    c._connected = True
+    c._has_control = True
+    busy_gate = asyncio.Event()
+    rc_entered = asyncio.Event()
+    rc_gate = asyncio.Event()
+    writes: list[bytes] = []
+
+    class Client:
+        is_connected = True
+
+        async def write_gatt_char(self, uuid, data, response=True) -> None:
+            if data[0] == FTMSOpcode.SET_TARGET_SPEED:
+                await busy_gate.wait()
+            if data[0] == FTMSOpcode.REQUEST_CONTROL:
+                rc_entered.set()
+                await rc_gate.wait()
+            writes.append(bytes(data))
+            c._on_control_point_response(0, bytearray([0x80, data[0], 0x01]))
+
+    c._client = Client()  # type: ignore[assignment]
+
+    async def run() -> bool:
+        busy = asyncio.create_task(
+            c._write_control_point(FTMSOpcode.SET_TARGET_SPEED, b"\x64\x00")
+        )
+        await asyncio.sleep(0)  # holds the CP lock
+        reset = asyncio.create_task(c._write_control_point(FTMSOpcode.RESET))
+        await asyncio.sleep(0)  # queued for the CP lock
+        start = asyncio.create_task(c.start())
+        await asyncio.sleep(0)  # control still set: queued behind RESET
+        busy_gate.set()
+        await asyncio.gather(busy, reset)
+        await rc_entered.wait()  # REQUEST_CONTROL from the write path
+        c._note_halt()
+        rc_gate.set()
+        return await start
+
+    assert asyncio.run(run()) is False
+    assert bytes([FTMSOpcode.START_OR_RESUME]) not in writes
+    assert bytes([FTMSOpcode.REQUEST_CONTROL]) in writes
