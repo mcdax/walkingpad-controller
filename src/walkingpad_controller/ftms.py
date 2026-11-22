@@ -62,6 +62,13 @@ _LOGGER = logging.getLogger(__name__)
 # not the firmware's replay of its previous state.
 _STATUS_REPLAY_WINDOW = 2.0
 
+# Connection parameters requested on ESPHome Bluetooth proxies: min/max
+# interval in 1.25 ms units (30-50 ms, the BlueZ default), latency, and
+# supervision timeout in 10 ms units (4 s). The proxies otherwise keep the
+# link at 8.75-11.25 ms, and at that interval the KS-HD-Z1D stops reacting
+# to its own remote control while connected.
+_RELAXED_CONN_PARAMS = (24, 40, 0, 400)
+
 # How long a Control Point write waits for its acknowledgement. On the vendor
 # pre-amble path this replaces (not caps) the caller's timeout.
 _CP_ACK_TIMEOUT = 5.0
@@ -357,6 +364,7 @@ class FTMSController:
         # Discover services so we can detect supplement / vendor pre-amble
         # characteristics. Local (BlueZ-cached) — no extra GATT round-trips.
         await self._discover_services()
+        await self._relax_connection_interval()
 
         # Read device capabilities (Speed Range, FTMS Feature, Software
         # Revision). Bisection in tests/probe_setup_killer.py showed pure
@@ -448,6 +456,24 @@ class FTMSController:
         self._cp_response_event.set()
         self._status_ack_event.set()
         self._session_end_event.set()
+
+    async def _relax_connection_interval(self) -> None:
+        """Ask an ESPHome Bluetooth proxy for a 30-50 ms connection interval.
+
+        Only the ESPHome backend (bleak-esphome, used by Home Assistant)
+        offers this; other backends are left alone. Older proxy firmware
+        ignores the request. Failure is not fatal.
+        """
+        backend = getattr(self._client, "_backend", None)
+        set_params = getattr(backend, "set_connection_params", None)
+        if set_params is None:
+            return
+        try:
+            await set_params(*_RELAXED_CONN_PARAMS)
+        except Exception as err:
+            _LOGGER.debug("FTMS: Could not relax the connection interval: %s", err)
+            return
+        _LOGGER.debug("FTMS: Requested a 30-50 ms connection interval from the proxy")
 
     async def _discover_services(self) -> None:
         """Discover and log BLE services."""
