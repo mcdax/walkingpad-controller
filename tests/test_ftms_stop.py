@@ -62,7 +62,12 @@ class Pad:
         self.session_end_on_stop = False
         self._frames_since_pause = 0
         self._tasks: list[asyncio.Task] = []
-        self.c._write_control_point_result = self._write_result  # type: ignore[method-assign]
+        # Fake the link below the Control Point lock, so the real
+        # serialisation, halt check and control re-request run.
+        self.c._write_and_wait = self._write_and_wait  # type: ignore[method-assign]
+
+    async def _write_and_wait(self, opcode, params, timeout, **kwargs) -> _CPResult:
+        return await self._write_result(opcode, params)
 
     async def _write_result(self, opcode, params=b"", *args, **kwargs) -> _CPResult:
         result = await self._write(opcode, params)
@@ -374,3 +379,95 @@ def test_stop_at_rest_does_not_mark_run_down() -> None:
     pad.c._machine_status_first_event_seen = True
     pad.c._on_machine_status(0, bytearray([0x02, 0x01]))
     assert pad.c._stopping is False
+
+
+# --- Astra review: halts win over pending starts / speed changes ---------
+
+START = (FTMSOpcode.START_OR_RESUME, b"")
+
+
+def _speed_cmds(pad: Pad) -> list[tuple[int, bytes]]:
+    return [cmd for cmd in pad.sent if cmd[0] == FTMSOpcode.SET_TARGET_SPEED]
+
+
+def test_pause_during_run_down_wait_cancels_the_start() -> None:
+    pad = Pad(pause_before_stop=False, speed=2.0)
+    pad.c._stopping = True
+    pad.on_pause = []
+
+    async def run() -> bool:
+        start = asyncio.create_task(pad.c.start())
+        await asyncio.sleep(FRAME_GAP)
+        await pad.c.pause()
+        pad.c._on_treadmill_data(0, treadmill_frame(0.0))  # run-down ends
+        return await start
+
+    assert asyncio.run(run()) is False
+    assert START not in pad.sent
+
+
+def test_stop_during_motion_wait_cancels_the_start_promptly() -> None:
+    # start() holds the op lock while waiting for motion; stop() must not
+    # wait for that (up to 15 s), and no START may follow the stop.
+    pad = Pad(pause_before_stop=False, speed=0.0)
+
+    async def run() -> tuple[bool, bool, float]:
+        loop = asyncio.get_running_loop()
+        start = asyncio.create_task(pad.c.start())
+        await asyncio.sleep(FRAME_GAP)  # START sent, belt not moving yet
+        t0 = loop.time()
+        stopped = await pad.c.stop()
+        return await start, stopped, loop.time() - t0
+
+    started, stopped, latency = asyncio.run(run())
+    assert started is False
+    assert stopped is True
+    assert latency < 1.0
+    assert pad.sent == [START, STOP]
+
+
+def test_set_speed_racing_a_stop_waits_for_the_run_down() -> None:
+    # stop() acked, FM Status not (yet) received: the run-down is known from
+    # our own STOP, so set_speed() starts again only at 0 km/h.
+    pad = Pad(pause_before_stop=False, speed=3.0)
+    pad.stop_frames = [[2.0, 1.0, 0.0, 0.0, 1.0, 1.0]]
+
+    async def run() -> bool:
+        assert await pad.c.stop() is True
+        assert pad.c._stopping is True
+        return await pad.c.set_speed(2.0)
+
+    assert asyncio.run(run()) is True
+    assert pad.sent[0] == STOP
+    assert pad.sent[1] == START
+    start_index = pad.sent.index(START)
+    assert pad.speed_at_send[start_index] == 0.0
+    assert _speed_cmds(pad), "speed set after the restart"
+
+
+def test_set_speed_while_running_sends_only_the_speed() -> None:
+    pad = Pad(pause_before_stop=False, speed=2.0)
+    assert asyncio.run(pad.c.set_speed(3.0)) is True
+    assert [op for op, _ in pad.sent] == [FTMSOpcode.SET_TARGET_SPEED]
+
+
+def test_pause_cancels_a_pending_speed_change() -> None:
+    pad = Pad(pause_before_stop=False, speed=0.0)
+    pad.on_pause = []
+
+    async def run() -> bool:
+        change = asyncio.create_task(pad.c.set_speed(2.0))
+        await asyncio.sleep(FRAME_GAP)  # START sent, waiting for motion
+        await pad.c.pause()
+        pad.c._on_treadmill_data(0, treadmill_frame(1.0))
+        return await change
+
+    assert asyncio.run(run()) is False
+    assert not _speed_cmds(pad)
+
+
+def test_backend_set_speed_zero_pauses_and_never_starts() -> None:
+    pad = Pad(pause_before_stop=False, speed=0.0)
+    pad.on_pause = []
+    asyncio.run(pad.c.set_speed(0))
+    assert pad.sent == [PAUSE]

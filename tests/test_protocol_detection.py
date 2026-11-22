@@ -39,3 +39,24 @@ def _controller(name: str) -> WalkingPadController:
 )
 def test_protocol_detected_from_name(ble_name: str, expected: ProtocolType) -> None:
     assert _controller(ble_name).protocol == expected
+
+
+def test_name_set_after_construction_is_used_on_connect() -> None:
+    from types import SimpleNamespace
+
+    from walkingpad_controller import ProtocolType, WalkingPadController
+
+    c = WalkingPadController(SimpleNamespace(name=None, address="AA:BB"), name="WalkingPad")
+    assert c._detect_protocol_from_name() is None
+    c.set_name("KS-HD-Z1D")
+    assert c._detect_protocol_from_name() is ProtocolType.FTMS
+
+
+def test_live_ble_name_still_wins_over_set_name() -> None:
+    from types import SimpleNamespace
+
+    from walkingpad_controller import ProtocolType, WalkingPadController
+
+    c = WalkingPadController(SimpleNamespace(name="SPERAX_P3MAX", address="AA:BB"))
+    c.set_name("KS-HD-Z1D")
+    assert c._detect_protocol_from_name() is ProtocolType.SPERAX

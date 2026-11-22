@@ -312,8 +312,10 @@ class WalkingPadController:
         self._connected = False
         if backend is not None:
             # Bleak reports explicit disconnects too; the old backend must
-            # not tell our users that the new link dropped.
+            # not tell our users that the new link dropped, nor forward a
+            # late notification as the new link's status.
             backend._disconnect_callbacks.clear()
+            backend._status_callbacks.clear()
             try:
                 await backend.disconnect()
             except Exception:
@@ -497,32 +499,16 @@ class WalkingPadController:
             # start a stopped belt.
             # The cached speed can be stale (e.g. 0 right after a reconnect),
             # so always ask the belt to pause; a stopped belt may reject it.
+            # A disconnect resets the cached speed to 0, which proves nothing
+            # about the belt, so only trust it while still connected.
             paused = await self.pause()
-            return paused or self.status.speed == 0
+            return paused or (self.connected and self.status.speed == 0)
 
         if self._ftms:
-            if (
-                self._ftms.status.speed > 0
-                and not self._ftms._paused
-                and not self._ftms._stopping
-            ):
-                # Belt already running — safe to send speed directly. A belt
-                # still decelerating after PAUSE takes the start path below.
-                return await self._ftms.set_target_speed(speed_kmh)
-            else:
-                # Belt is stopped — start it first, then send the requested
-                # target speed once spin-up has completed. Sending the
-                # target speed during the cold-start window crashes the
-                # BLE connection on KingSmith firmware, so `start()` blocks
-                # until speed > 0 before we proceed here.
-                _LOGGER.info(
-                    "Belt is stopped — starting first, then setting speed %.1f",
-                    speed_kmh,
-                )
-                started = await self._ftms.start()
-                if not started:
-                    return False
-                return await self._ftms.set_target_speed(speed_kmh)
+            # The FTMS backend decides between "set directly" and "start
+            # first" under its operation lock (cold-start and run-down
+            # invariants, see FTMSController.set_speed).
+            return await self._ftms.set_speed(speed_kmh)
 
         elif self._wilink:
             return await self._wilink.set_target_speed(speed_kmh)
@@ -618,6 +604,16 @@ class WalkingPadController:
             self._on_status_update(backend.status)
         else:
             self._connected = False
+
+    def set_name(self, name: str) -> None:
+        """Set the name used when the BLEDevice carries none.
+
+        It is the fallback for name-based protocol detection on the next
+        ``connect()`` (e.g. a name Home Assistant learned from a scan
+        response after setup). The live ``BLEDevice.name`` still wins.
+        """
+        if name:
+            self._name = name
 
     def update_ble_device(self, ble_device: BLEDevice) -> None:
         """Update the BLE device reference (e.g., after rediscovery).

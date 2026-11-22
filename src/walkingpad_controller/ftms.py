@@ -130,6 +130,7 @@ class _Standstill(enum.Enum):
     STILL_MOVING = "still_moving"
     NO_TELEMETRY = "no_telemetry"
     DISCONNECTED = "disconnected"
+    HALTED = "halted"  # pause()/stop() was requested meanwhile
 
 
 class FTMSController:
@@ -828,14 +829,7 @@ class FTMSController:
             return
 
         # Wake any pending command waiter that's expecting this opcode.
-        if (
-            self._status_ack_expected_opcode is not None
-            and opcode == self._status_ack_expected_opcode
-            and (
-                self._status_ack_expected_param is None
-                or (len(data) >= 2 and data[1] == self._status_ack_expected_param)
-            )
-        ):
+        if self._matches_expected_ack(opcode, data):
             self._status_ack_event.set()
 
         self._apply_machine_status(opcode, data)
@@ -869,23 +863,23 @@ class FTMSController:
             # without the vendor pre-amble there is never an expected ack
             # opcode, so this is how their first real event survives.
             return False
-        if (
-            self._status_ack_expected_opcode is not None
-            and opcode == self._status_ack_expected_opcode
-        ):
+        # Opcode and STOP/PAUSE parameter must match, so a stale STOP replay
+        # can't pass for the ack of a pending PAUSE (or vice versa).
+        if self._matches_expected_ack(opcode, data):
             _LOGGER.debug(
-                "FTMS: First 2ADA event after subscribe matches expected "
-                "ack opcode 0x%02x — treating as real ack, not stale replay",
+                "FTMS: First 2ADA event after subscribe matches the expected "
+                "ack (opcode 0x%02x) — treating as real, not stale replay",
                 opcode,
             )
             return False
         if self._matches_last_command(opcode, data):
             # Devices without the pre-amble ack on the Control Point, so no
-            # ack opcode is armed; the event answering a command sent
-            # right after connect (e.g. PAUSE) is still real.
+            # ack opcode is armed; an event matching the command sent right
+            # after connect (e.g. PAUSE) is taken as real.
             _LOGGER.debug(
-                "FTMS: First 2ADA event after subscribe answers the last "
-                "command (opcode 0x%02x) — treating as real, not stale replay",
+                "FTMS: First 2ADA event after subscribe matches the event the "
+                "last command would cause (opcode 0x%02x) — treating as real, "
+                "not stale replay",
                 opcode,
             )
             return False
@@ -903,6 +897,16 @@ class FTMSController:
             return
         param = params[0] if opcode == FTMSOpcode.STOP_OR_PAUSE and params else None
         self._last_cp_status = (status_opcode, param)
+
+    def _matches_expected_ack(self, opcode: int, data: bytearray) -> bool:
+        """Return whether a status event is the ack a pending command awaits."""
+        if self._status_ack_expected_opcode is None:
+            return False
+        if opcode != self._status_ack_expected_opcode:
+            return False
+        return self._status_ack_expected_param is None or (
+            len(data) >= 2 and data[1] == self._status_ack_expected_param
+        )
 
     def _matches_last_command(self, opcode: int, data: bytearray) -> bool:
         """Return whether a status event is the effect of the last command."""
@@ -1005,7 +1009,12 @@ class FTMSController:
     # --- Control Commands ---
 
     async def _write_control_point(
-        self, opcode: FTMSOpcode, params: bytes = b"", timeout: float = _CP_ACK_TIMEOUT
+        self,
+        opcode: FTMSOpcode,
+        params: bytes = b"",
+        timeout: float = _CP_ACK_TIMEOUT,
+        *,
+        halt_seq: int | None = None,
     ) -> bool:
         """Write a command to the FTMS Control Point and wait for response.
 
@@ -1013,22 +1022,49 @@ class FTMSController:
         vendor pre-amble path a missing ack also counts as success (see
         `_write_and_wait`).
         """
-        result = await self._write_control_point_result(opcode, params, timeout)
+        result = await self._write_control_point_result(
+            opcode, params, timeout, halt_seq=halt_seq
+        )
         if result is _CPResult.TIMEOUT:
             return self._capabilities.has_vendor_preamble
         return result is _CPResult.ACK
 
     async def _write_control_point_result(
-        self, opcode: FTMSOpcode, params: bytes = b"", timeout: float = _CP_ACK_TIMEOUT
+        self,
+        opcode: FTMSOpcode,
+        params: bytes = b"",
+        timeout: float = _CP_ACK_TIMEOUT,
+        *,
+        halt_seq: int | None = None,
     ) -> _CPResult:
         """Like `_write_control_point`, but report how the write ended.
 
         Writes are serialised: the response slot is shared, so a second
         command must not clear or consume the first one's acknowledgement.
+
+        With ``halt_seq``, the command is dropped (NOT_SENT) if pause() or
+        stop() was requested since — checked after the lock is acquired,
+        right before the write. Control is (re)requested inside the same
+        lock when it was lost, e.g. by a RESET queued ahead of this write.
         """
         async with self._cp_lock:
             try:
-                return await self._write_and_wait(opcode, params, timeout)
+                if halt_seq is not None and self._pause_seq != halt_seq:
+                    _LOGGER.info(
+                        "FTMS: Halt requested; not sending opcode 0x%02x", opcode
+                    )
+                    return _CPResult.NOT_SENT
+                if opcode != FTMSOpcode.REQUEST_CONTROL and not self._has_control:
+                    await self._request_control_locked()
+                if opcode == FTMSOpcode.RESET:
+                    # A Reset revokes control (FTMS spec; the KS-HD-Z1D then
+                    # answers nothing). Drop it before writing, so a lost ack,
+                    # an error or a cancellation can't leave it set; after a
+                    # rejected RESET this only costs one extra REQUEST_CONTROL.
+                    self._has_control = False
+                return await self._write_and_wait(
+                    opcode, params, timeout, halt_seq=halt_seq
+                )
             finally:
                 # Always clear the expectation, also on error or cancellation.
                 self._status_ack_expected_opcode = None
@@ -1036,7 +1072,12 @@ class FTMSController:
                 self._cp_pending_opcode = None
 
     async def _write_and_wait(
-        self, opcode: FTMSOpcode, params: bytes, timeout: float
+        self,
+        opcode: FTMSOpcode,
+        params: bytes,
+        timeout: float,
+        *,
+        halt_seq: int | None = None,
     ) -> _CPResult:
         """Body of `_write_control_point_result`; caller holds `_cp_lock`."""
         if not self.connected:
@@ -1045,8 +1086,21 @@ class FTMSController:
         client = self._client
         assert client is not None
 
+        # Re-check the halt here, not only before the lock: a REQUEST_CONTROL
+        # sent just before (and the pre-amble write below) are suspension
+        # points.
+        if halt_seq is not None and self._pause_seq != halt_seq:
+            _LOGGER.info("FTMS: Halt requested; not sending opcode 0x%02x", opcode)
+            return _CPResult.NOT_SENT
         if self._capabilities.has_vendor_preamble:
             await self._write_vendor_preamble(client)
+            if halt_seq is not None and self._pause_seq != halt_seq:
+                _LOGGER.info(
+                    "FTMS: Halt requested; not sending opcode 0x%02x", opcode
+                )
+                return _CPResult.NOT_SENT
+            if not self.connected:
+                return _CPResult.NOT_SENT
         expected_status_opcode = self._arm_status_ack(opcode, params)
         self._note_cp_command(opcode, params)
 
@@ -1198,7 +1252,12 @@ class FTMSController:
         return _CPResult.REJECTED
 
     async def _request_control(self) -> bool:
-        """Request control of the fitness machine.
+        """Request control of the fitness machine (takes `_cp_lock`)."""
+        async with self._cp_lock:
+            return await self._request_control_locked()
+
+    async def _request_control_locked(self) -> bool:
+        """Request control of the fitness machine; caller holds `_cp_lock`.
 
         Some KingSmith firmware (e.g. MC-21) rejects REQUEST_CONTROL with
         OPERATION_FAILED / CONTROL_NOT_PERMITTED but still accepts the
@@ -1207,8 +1266,17 @@ class FTMSController:
         every subsequent command doesn't keep retrying a call we know will
         fail. See issue #1.
         """
-        result = await self._write_control_point(FTMSOpcode.REQUEST_CONTROL)
-        self._has_control = True
+        try:
+            response = await self._write_and_wait(
+                FTMSOpcode.REQUEST_CONTROL, b"", _CP_ACK_TIMEOUT
+            )
+        finally:
+            self._status_ack_expected_opcode = None
+            self._status_ack_expected_param = None
+            self._cp_pending_opcode = None
+        result = response is _CPResult.ACK
+        if response is not _CPResult.NOT_SENT:
+            self._has_control = True
         if result:
             _LOGGER.info("FTMS: Control acquired")
         else:
@@ -1238,25 +1306,31 @@ class FTMSController:
             START was rejected while the belt is at rest, the belt didn't
             move in time, or pause() was called meanwhile.
         """
+        halt_seq = self._pause_seq
         async with self._op_lock:
-            return await self._start_locked()
+            return await self._start_locked(halt_seq)
 
-    async def _start_locked(self) -> bool:
-        pause_seq = self._pause_seq
+    async def _start_locked(self, pause_seq: int) -> bool:
+        """Body of start(); ``pause_seq`` is the halt generation seen by the
+        caller before it queued for `_op_lock`, so a pause()/stop() requested
+        meanwhile cancels this start."""
         await self._ensure_control_requested()
 
         if not self.connected:
             _LOGGER.warning("FTMS: Not connected; cannot start")
             return False
         if self._pause_seq != pause_seq:
-            _LOGGER.info("FTMS: Paused before START was sent; start abandoned")
+            _LOGGER.info("FTMS: Halt requested before START was sent; start abandoned")
             return False
 
         if self._stopping:
             _LOGGER.info("FTMS: Belt still running down after STOP; waiting before START")
             outcome = await self._wait_for_standstill(
-                self._treadmill_data_seq, self._standstill_timeout
+                self._treadmill_data_seq, self._standstill_timeout, pause_seq
             )
+            if outcome is _Standstill.HALTED:
+                _LOGGER.info("FTMS: Halt requested during run-down; start abandoned")
+                return False
             if outcome is not _Standstill.CONFIRMED:
                 _LOGGER.warning(
                     "FTMS: Belt did not come to rest after STOP (%s); start abandoned",
@@ -1266,7 +1340,13 @@ class FTMSController:
 
         seq = self._treadmill_data_seq
         kind = "resume" if self._status.belt_state == BeltState.PAUSED else "cold start"
-        accepted = await self._write_control_point(FTMSOpcode.START_OR_RESUME)
+        accepted = await self._write_control_point(
+            FTMSOpcode.START_OR_RESUME, halt_seq=pause_seq
+        )
+        if self._pause_seq != pause_seq:
+            # Either START was not sent, or a halt arrived during its ack.
+            _LOGGER.info("FTMS: Halt requested while starting; start abandoned")
+            return False
 
         if not self.connected:
             _LOGGER.warning("FTMS: Connection lost during START_OR_RESUME")
@@ -1282,7 +1362,7 @@ class FTMSController:
                     _LOGGER.warning("FTMS: Connection lost waiting for belt to start")
                     return False
                 if self._pause_seq != pause_seq:
-                    _LOGGER.info("FTMS: Paused while starting; start abandoned")
+                    _LOGGER.info("FTMS: Halt requested while starting; start abandoned")
                     return False
                 _LOGGER.warning("FTMS: Belt did not start moving within timeout")
                 return False
@@ -1364,6 +1444,10 @@ class FTMSController:
             case the belt has been asked to pause, but its state may be
             unknown — see the log).
         """
+        # Register the halt before queueing for the lock: a start() or
+        # set_speed() holding it (e.g. waiting for the belt to move) gives up
+        # instead of making STOP wait behind it.
+        self._note_halt()
         async with self._op_lock:
             await self._ensure_control_requested()
             if not self._capabilities.pause_before_stop:
@@ -1416,6 +1500,11 @@ class FTMSController:
         """
         if not await self._send_stop_command():
             return False
+        # The belt runs down now; START/SET_TARGET_SPEED would be lost until
+        # it stops. Don't rely on the FM Status event alone (it may be late,
+        # missing or a RESET instead of 02 01).
+        if self._status.speed > 0:
+            self._stopping = True
         # The session has ended. Not every device says so: the KS-HD-Z1D
         # answers a STOP from pause with FM Status RESET (0x01) instead of
         # 02 01, and at 0 km/h no Treadmill Data frame would correct a
@@ -1531,13 +1620,21 @@ class FTMSController:
                 return _Standstill.CONFIRMED
             await self._wait_for_next_frame(remaining)
 
-    async def _wait_for_standstill(self, after_seq: int, timeout: float) -> _Standstill:
-        """Wait for a Treadmill Data frame newer than ``after_seq`` with speed 0."""
+    async def _wait_for_standstill(
+        self, after_seq: int, timeout: float, pause_seq: int | None = None
+    ) -> _Standstill:
+        """Wait for a Treadmill Data frame newer than ``after_seq`` with speed 0.
+
+        With ``pause_seq``, returns HALTED as soon as pause()/stop() is
+        requested.
+        """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while True:
             if not self.connected:
                 return _Standstill.DISCONNECTED
+            if pause_seq is not None and self._pause_seq != pause_seq:
+                return _Standstill.HALTED
             if self._treadmill_data_seq > after_seq and self._status.speed == 0:
                 return _Standstill.CONFIRMED
             remaining = deadline - loop.time()
@@ -1547,6 +1644,11 @@ class FTMSController:
                 return _Standstill.STILL_MOVING
             await self._wait_for_next_frame(remaining)
 
+    def _note_halt(self) -> None:
+        """Bump the halt generation and wake waiters (pause() and stop())."""
+        self._pause_seq += 1
+        self._treadmill_data_event.set()  # let a waiting start() see it
+
     async def pause(self) -> bool:
         """Pause the treadmill.
 
@@ -1554,8 +1656,7 @@ class FTMSController:
         Point writes), so it can halt the belt while e.g. start() is still
         waiting for the belt to move.
         """
-        self._pause_seq += 1
-        self._treadmill_data_event.set()  # let a waiting start() see it
+        self._note_halt()
         await self._ensure_control_requested()
         return await self._write_control_point(
             FTMSOpcode.STOP_OR_PAUSE,
@@ -1566,6 +1667,8 @@ class FTMSController:
         """Reset the fitness machine."""
         async with self._op_lock:
             await self._ensure_control_requested()
+            # The write path drops control after a RESET; the next command
+            # requests it again.
             return await self._write_control_point(FTMSOpcode.RESET)
 
     async def set_target_speed(self, speed_kmh: float) -> bool:
@@ -1580,6 +1683,43 @@ class FTMSController:
         Returns:
             True if the command was acknowledged with success.
         """
+        async with self._op_lock:
+            return await self._set_target_speed_locked(speed_kmh)
+
+    async def set_speed(self, speed_kmh: float) -> bool:
+        """Set the speed, starting the belt first if it isn't running.
+
+        Decides under `_op_lock`, so a concurrent stop() can't slip between
+        the decision and the write. Never sends SET_TARGET_SPEED during
+        spin-up (start() waits for motion) or the run-down after STOP
+        (start() waits for standstill). A pause()/stop() requested after
+        this call cancels it.
+        """
+        if speed_kmh <= 0:
+            # 0 km/h means "halt", never "start at minimum speed".
+            return await self.pause()
+        halt_seq = self._pause_seq
+        async with self._op_lock:
+            if self._pause_seq != halt_seq:
+                _LOGGER.info("FTMS: Halt requested; speed change abandoned")
+                return False
+            running = (
+                self._status.speed > 0 and not self._paused and not self._stopping
+            )
+            if not running:
+                _LOGGER.info(
+                    "FTMS: Belt not running — starting first, then setting "
+                    "speed %.1f",
+                    speed_kmh,
+                )
+                if not await self._start_locked(halt_seq):
+                    return False
+            return await self._set_target_speed_locked(speed_kmh, halt_seq=halt_seq)
+
+    async def _set_target_speed_locked(
+        self, speed_kmh: float, *, halt_seq: int | None = None
+    ) -> bool:
+        """Body of set_target_speed(); caller holds `_op_lock`."""
         sr = self._capabilities.speed_range
 
         # Round to the nearest increment, then clamp, so rounding can't push
@@ -1593,15 +1733,15 @@ class FTMSController:
         speed_raw = int(round(speed_kmh * 100))
         params = struct.pack("<H", speed_raw)
 
-        async with self._op_lock:
-            await self._ensure_control_requested()
-
-            _LOGGER.debug(
-                "FTMS: Setting target speed to %.2f km/h (raw: %d)",
-                speed_kmh,
-                speed_raw,
-            )
-            return await self._write_control_point(FTMSOpcode.SET_TARGET_SPEED, params)
+        await self._ensure_control_requested()
+        _LOGGER.debug(
+            "FTMS: Setting target speed to %.2f km/h (raw: %d)",
+            speed_kmh,
+            speed_raw,
+        )
+        return await self._write_control_point(
+            FTMSOpcode.SET_TARGET_SPEED, params, halt_seq=halt_seq
+        )
 
     async def set_target_inclination(self, inclination_pct: float) -> bool:
         """Set the target inclination in percent.
