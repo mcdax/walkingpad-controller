@@ -176,6 +176,10 @@ class FTMSController:
         # cause; lets the first event after subscribe through if it answers
         # a command rather than replaying old state.
         self._last_cp_status: tuple[int, int | None] | None = None
+        # Set when (re)subscribing: the first Treadmill Data frame tells
+        # whether the belt is in a paused session (0 km/h, elapsed time
+        # kept). The KS-HD-Z1D sends no status event for that on connect.
+        self._check_pause_on_connect = False
 
         # Fitness Machine Status (2ADA) ack — used on the vendor pre-amble
         # path, where most Control Point opcodes are acknowledged via a
@@ -440,6 +444,7 @@ class FTMSController:
         self._machine_status_first_event_seen = False
         self._status_subscribed_at = None
         self._last_cp_status = None
+        self._check_pause_on_connect = False
         self._status.speed = 0.0
         self._status.belt_state = BeltState.STOPPED
         self._wake_waiters()
@@ -621,6 +626,7 @@ class FTMSController:
             ),
         )
 
+        self._check_pause_on_connect = True
         for uuid, handler, label, delay_after, required in subscriptions:
             try:
                 # Stamp before the CCCD write: the replay can be dispatched
@@ -788,6 +794,9 @@ class FTMSController:
                 handler(data, offset)
             offset += size
 
+        if self._check_pause_on_connect:
+            self._detect_pause_on_connect(speed_raw, flags)
+
         self._status.mode = 1  # FTMS is always manual mode
         self._status.timestamp = time.time()
 
@@ -801,6 +810,25 @@ class FTMSController:
         )
 
         self._notify_status()
+
+    def _detect_pause_on_connect(self, speed_raw: int, flags: int) -> None:
+        """Recognise a paused session on the first frame after connecting.
+
+        Connecting to a paused KS-HD-Z1D brings no status event, so
+        belt_state read STOPPED. A paused session is at 0 km/h with its
+        elapsed time kept; a stopped one reports 0 s. Decided once.
+        """
+        self._check_pause_on_connect = False
+        if self._paused or speed_raw != 0:
+            return
+        if not flags & TreadmillDataFlags.ELAPSED_TIME or self._status.duration == 0:
+            return
+        _LOGGER.info(
+            "FTMS: Paused session found after connecting (%ds elapsed)",
+            self._status.duration,
+        )
+        self._paused = True
+        self._status.belt_state = BeltState.PAUSED
 
     def _parse_distance(self, data: bytearray, offset: int) -> None:
         self._status.distance = (
@@ -945,6 +973,7 @@ class FTMSController:
 
     def _apply_machine_status(self, opcode: int, data: bytearray) -> None:
         """Update pause/belt state (and log) for one FM Status event."""
+        self._check_pause_on_connect = False  # a status event says more
         if opcode == FitnessMachineStatusOpcode.STOPPED_OR_PAUSED:
             if len(data) >= 2:
                 if data[1] == FTMSStopPauseParam.STOP:

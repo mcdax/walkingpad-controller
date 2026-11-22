@@ -7,6 +7,7 @@ cancellation, fresh-telemetry start, and pause() while start() waits.
 from __future__ import annotations
 
 import asyncio
+import struct
 import time
 from types import SimpleNamespace
 
@@ -997,3 +998,50 @@ def test_other_backends_and_failures_are_left_alone() -> None:
 
     c._client = SimpleNamespace(_backend=Failing())  # type: ignore[assignment]
     asyncio.run(c._relax_connection_interval())  # not fatal
+
+
+def _frame_with_elapsed(kmh: float, elapsed_s: int) -> bytearray:
+    """Treadmill Data with speed and elapsed time (flag 0x0400)."""
+    return bytearray(struct.pack("<HHH", 0x0400, round(kmh * 100), elapsed_s))
+
+
+def _just_connected() -> FTMSController:
+    c = FTMSController()
+    c._check_pause_on_connect = True  # set by _subscribe_notifications
+    return c
+
+
+def test_connecting_to_a_paused_session_reports_paused() -> None:
+    # KS-HD-Z1D: no status event on connect; 0 km/h with elapsed time kept.
+    c = _just_connected()
+    c._on_treadmill_data(0, _frame_with_elapsed(0.0, 140))
+    assert c._paused is True
+    assert c.status.belt_state == BeltState.PAUSED
+
+
+def test_connecting_without_a_session_stays_stopped() -> None:
+    c = _just_connected()
+    c._on_treadmill_data(0, _frame_with_elapsed(0.0, 0))
+    assert c._paused is False
+    assert c.status.belt_state == BeltState.STOPPED
+
+
+def test_connecting_to_a_running_belt_is_not_a_pause() -> None:
+    c = _just_connected()
+    c._on_treadmill_data(0, _frame_with_elapsed(2.0, 140))
+    c._on_treadmill_data(0, _frame_with_elapsed(0.0, 141))  # decided already
+    assert c._paused is False
+
+
+def test_pause_check_only_once_and_only_after_connecting() -> None:
+    c = FTMSController()  # not armed
+    c._on_treadmill_data(0, _frame_with_elapsed(0.0, 140))
+    assert c._paused is False
+
+
+def test_status_event_supersedes_the_connect_check() -> None:
+    c = _just_connected()
+    c._machine_status_first_event_seen = True
+    c._on_machine_status(0, bytearray([0x02, 0x01]))  # STOP
+    c._on_treadmill_data(0, _frame_with_elapsed(0.0, 140))
+    assert c._paused is False
