@@ -312,8 +312,10 @@ class WalkingPadController:
         self._connected = False
         if backend is not None:
             # Bleak reports explicit disconnects too; the old backend must
-            # not tell our users that the new link dropped.
+            # not tell our users that the new link dropped, nor forward a
+            # late notification as the new link's status.
             backend._disconnect_callbacks.clear()
+            backend._status_callbacks.clear()
             try:
                 await backend.disconnect()
             except Exception:

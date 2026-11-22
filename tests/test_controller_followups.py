@@ -157,3 +157,22 @@ def test_set_speed_zero_does_not_claim_a_halt_after_a_disconnect() -> None:
 
     pad.c.pause = pause_and_drop  # type: ignore[method-assign]
     assert asyncio.run(wp.set_speed(0)) is False
+
+
+def test_closed_backend_cannot_report_status(monkeypatch) -> None:
+    connects: list[FTMSController] = []
+
+    async def connect(self, ble_device, name=None):
+        connects.append(self)
+        self._client = FakeClient()
+        self._connected = True
+
+    monkeypatch.setattr(FTMSController, "connect", connect)
+    wp = WalkingPadController(DEVICE)  # type: ignore[arg-type]
+    asyncio.run(wp.connect())
+    wp._ftms._client.is_connected = False  # type: ignore[union-attr]
+    asyncio.run(wp.connect())  # closes the old backend
+    seen: list[float] = []
+    wp.register_status_callback(lambda st: seen.append(st.speed))
+    connects[0]._on_treadmill_data(0, treadmill_frame(2.0))  # late frame, old link
+    assert seen == []
