@@ -501,7 +501,11 @@ class WalkingPadController:
             return paused or self.status.speed == 0
 
         if self._ftms:
-            if self._ftms.status.speed > 0 and not self._ftms._paused:
+            if (
+                self._ftms.status.speed > 0
+                and not self._ftms._paused
+                and not self._ftms._stopping
+            ):
                 # Belt already running — safe to send speed directly. A belt
                 # still decelerating after PAUSE takes the start path below.
                 return await self._ftms.set_target_speed(speed_kmh)
