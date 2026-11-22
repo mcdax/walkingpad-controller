@@ -339,3 +339,38 @@ def test_control_point_acks_are_not_shared_between_concurrent_writes() -> None:
     paused, speed = asyncio.run(run())
     assert paused is False and speed is True
     assert [w[0] for w in writes] == [0x08, 0x02]
+
+
+def test_start_waits_for_run_down_after_stop() -> None:
+    # KS-HD-Z1D: START/SET_TARGET_SPEED sent while the belt runs down after
+    # STOP are acked but lost, so start() must wait for 0 km/h first.
+    pad = Pad(pause_before_stop=False, speed=2.5)
+    pad.c._machine_status_first_event_seen = True
+    pad.c._on_machine_status(0, bytearray([0x02, 0x01]))  # STOP while moving
+    assert pad.c._stopping is True
+
+    async def run() -> bool:
+        async def run_down() -> None:
+            for kmh in (2.0, 1.0, 0.0):
+                await asyncio.sleep(FRAME_GAP)
+                pad.c._on_treadmill_data(0, treadmill_frame(kmh))
+            await asyncio.sleep(FRAME_GAP)
+            pad.c._on_treadmill_data(0, treadmill_frame(1.0))  # belt restarts
+
+        feeder = asyncio.create_task(run_down())
+        try:
+            return await pad.c.start()
+        finally:
+            feeder.cancel()
+
+    assert asyncio.run(run()) is True
+    start = (FTMSOpcode.START_OR_RESUME, b"")
+    assert pad.sent == [start]
+    assert pad.speed_at_send == [0.0]
+
+
+def test_stop_at_rest_does_not_mark_run_down() -> None:
+    pad = Pad(pause_before_stop=False, speed=0.0)
+    pad.c._machine_status_first_event_seen = True
+    pad.c._on_machine_status(0, bytearray([0x02, 0x01]))
+    assert pad.c._stopping is False

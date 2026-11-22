@@ -183,6 +183,10 @@ class FTMSController:
         # default STOPPED — so HA can distinguish "session paused, will
         # resume" from "session ended, counters reset on next start".
         self._paused: bool = False
+        # True from a session-ending STOP while the belt still moves until
+        # a frame reports 0 km/h. START and SET_TARGET_SPEED sent during that
+        # run-down are lost (the KS-HD-Z1D keeps stopping), so start() waits.
+        self._stopping: bool = False
 
         # Serialises multi-step operations (start / stop / set speed /
         # inclination / reset) so e.g. a SET_TARGET_SPEED can't land between
@@ -229,6 +233,11 @@ class FTMSController:
         # After START_OR_RESUME is rejected, how long start() waits for a
         # fresh Treadmill Data frame to tell whether the belt is running.
         self._start_rejected_grace = 2.0
+
+    @property
+    def stopping(self) -> bool:
+        """True while the belt runs down after a session-ending STOP."""
+        return self._stopping
 
     @property
     def connected(self) -> bool:
@@ -416,6 +425,7 @@ class FTMSController:
         self._connected = False
         self._has_control = False
         self._paused = False
+        self._stopping = False
         # Re-arm the replay check so the next connection's stale 2ADA
         # replay is also dropped.
         self._machine_status_first_event_seen = False
@@ -708,6 +718,8 @@ class FTMSController:
         # Data frame during the 5-10 s decel cleared it again, leaving
         # _paused = False by the time speed reached 0 and belt_state
         # mis-reporting STOPPED instead of PAUSED.
+        if speed_raw == 0:
+            self._stopping = False
         if speed_raw > 0:
             self._status.belt_state = BeltState.ACTIVE
         elif self._paused:
@@ -908,6 +920,7 @@ class FTMSController:
                 if data[1] == FTMSStopPauseParam.STOP:
                     _LOGGER.info("FTMS: Treadmill stopped by user")
                     self._paused = False
+                    self._stopping = self._status.speed > 0
                     # While moving, Treadmill Data with speed=0 follows and
                     # sets STOPPED. At rest (e.g. ending a paused session)
                     # no further frame may come, so set it here.
@@ -927,6 +940,7 @@ class FTMSController:
                 self._status.belt_state = BeltState.STOPPED
         elif opcode == FitnessMachineStatusOpcode.STARTED_OR_RESUMED:
             _LOGGER.info("FTMS: Treadmill started/resumed by user")
+            self._stopping = False
             # Treadmill Data never clears `_paused`; only FM Status events
             # (and a disconnect) do.
             self._paused = False
@@ -1237,6 +1251,18 @@ class FTMSController:
         if self._pause_seq != pause_seq:
             _LOGGER.info("FTMS: Paused before START was sent; start abandoned")
             return False
+
+        if self._stopping:
+            _LOGGER.info("FTMS: Belt still running down after STOP; waiting before START")
+            outcome = await self._wait_for_standstill(
+                self._treadmill_data_seq, self._standstill_timeout
+            )
+            if outcome is not _Standstill.CONFIRMED:
+                _LOGGER.warning(
+                    "FTMS: Belt did not come to rest after STOP (%s); start abandoned",
+                    outcome.value,
+                )
+                return False
 
         seq = self._treadmill_data_seq
         kind = "resume" if self._status.belt_state == BeltState.PAUSED else "cold start"
