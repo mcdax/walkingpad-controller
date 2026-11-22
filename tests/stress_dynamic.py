@@ -282,9 +282,16 @@ async def main():
     for i, cmd in enumerate(sequence):
         if not controller.connected:
             _LOGGER.warning("Not connected before step %d; reconnecting", i)
+            # Reconnect the same controller, as Home Assistant does: its
+            # connect() closes the old backend. A fresh controller would
+            # leave the old Bleak client subscribed (on BlueZ every
+            # notification then reaches both controllers).
             with contextlib.suppress(Exception):
-                await safe_disconnect(controller)
-            controller = await connect(name=args.name, on_disconnect=disc_cb)
+                await controller.connect()
+            if not controller.connected:
+                with contextlib.suppress(Exception):
+                    await controller._close_backend()
+                controller = await connect(name=args.name, on_disconnect=disc_cb)
             reconnect_count += 1
             if controller is None:
                 _LOGGER.error("Reconnect failed; aborting at step %d", i)
