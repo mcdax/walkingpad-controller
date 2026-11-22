@@ -102,7 +102,7 @@ def _timed_out_stop_pad(*, session_end_after: float | None) -> Pad:
             )
         return _CPResult.TIMEOUT
 
-    pad.c._write_control_point_result = write  # type: ignore[method-assign]
+    pad.c._write_and_wait = lambda op, params, timeout: write(op, params)  # type: ignore[method-assign,assignment]
     return pad
 
 
@@ -385,7 +385,7 @@ def test_pause_during_request_control_abandons_start() -> None:
             pad.c._pause_seq += 1  # pause() lands while REQUEST_CONTROL is in flight
         return await pad._write_result(opcode, params)
 
-    pad.c._write_control_point_result = write  # type: ignore[method-assign]
+    pad.c._write_and_wait = lambda op, params, timeout: write(op, params)  # type: ignore[method-assign,assignment]
     assert asyncio.run(pad.c.start()) is False
     assert FTMSOpcode.START_OR_RESUME not in [op for op, _ in pad.sent]
 
@@ -789,14 +789,7 @@ def test_first_status_event_without_a_command_is_still_a_replay() -> None:
     assert c._paused is False
 def test_reset_requests_control_again_before_the_next_command() -> None:
     pad = Pad(pause_before_stop=False, speed=2.0)
-    pad.c._write_control_point = pad._write  # type: ignore[method-assign]
-    requested: list[int] = []
-
-    async def request_control() -> None:
-        requested.append(1)
-        pad.c._has_control = True
-
-    pad.c._request_control = request_control  # type: ignore[method-assign]
+    request = (FTMSOpcode.REQUEST_CONTROL, b"")
 
     async def run() -> None:
         assert await pad.c.reset() is True
@@ -804,5 +797,54 @@ def test_reset_requests_control_again_before_the_next_command() -> None:
         await pad.c.set_target_speed(1.5)
 
     asyncio.run(run())
-    assert requested == [1]
+    ops = [op for op, _ in pad.sent]
+    assert ops == [FTMSOpcode.RESET, FTMSOpcode.REQUEST_CONTROL, FTMSOpcode.SET_TARGET_SPEED]
+    assert request in pad.sent
     assert pad.c._has_control is True
+
+
+def test_reset_without_ack_still_drops_control() -> None:
+    pad = Pad(pause_before_stop=False, speed=2.0)
+    pad.results[(FTMSOpcode.RESET, b"")] = [_CPResult.TIMEOUT]
+    asyncio.run(pad.c.reset())
+    assert pad.c._has_control is False
+
+
+def test_pause_queued_behind_reset_requests_control_first() -> None:
+    # pause() checks control before queueing for the CP lock; the write
+    # path must re-check after a RESET that was ahead of it.
+    pad = Pad(pause_before_stop=False, speed=2.0)
+    gate = asyncio.Event()
+    inner = pad._write_result
+
+    async def write(opcode, params=b"", *args, **kwargs):
+        if opcode == FTMSOpcode.RESET:
+            await gate.wait()
+        return await inner(opcode, params)
+
+    pad._write_result = write  # type: ignore[method-assign]
+
+    async def run() -> None:
+        reset = asyncio.create_task(pad.c.reset())
+        await asyncio.sleep(0)
+        pause = asyncio.create_task(pad.c.pause())
+        await asyncio.sleep(0)
+        gate.set()
+        await asyncio.gather(reset, pause)
+
+    asyncio.run(run())
+    ops = [op for op, _ in pad.sent]
+    assert ops == [FTMSOpcode.RESET, FTMSOpcode.REQUEST_CONTROL, FTMSOpcode.STOP_OR_PAUSE]
+
+
+def test_preamble_first_event_must_match_the_pending_param() -> None:
+    # MC-21 path: PAUSE pending, first event is a stale STOP replay.
+    c = FTMSController()
+    c._capabilities.has_vendor_preamble = True
+    c._status_subscribed_at = time.monotonic()
+    c._status_ack_expected_opcode = 0x02
+    c._status_ack_expected_param = FTMSStopPauseParam.PAUSE
+    c._paused = True
+    c._on_machine_status(0, bytearray([0x02, 0x01]))
+    assert c._paused is True  # replay dropped, not applied as session end
+    assert not c._status_ack_event.is_set()

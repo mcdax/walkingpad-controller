@@ -144,3 +144,16 @@ def test_closed_backend_cannot_report_a_disconnect(monkeypatch) -> None:
     wp.register_disconnect_callback(lambda: lost.append(True))
     connects[0]._on_disconnect(None)  # Bleak reports the old link closing
     assert lost == [] and wp.connected
+
+
+def test_set_speed_zero_does_not_claim_a_halt_after_a_disconnect() -> None:
+    pad = Pad(pause_before_stop=False, speed=3.0)
+    pad.on_pause = []
+    wp = _controller_with(pad)
+
+    async def pause_and_drop() -> bool:
+        pad.drop_link()
+        return False
+
+    pad.c.pause = pause_and_drop  # type: ignore[method-assign]
+    assert asyncio.run(wp.set_speed(0)) is False
