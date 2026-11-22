@@ -787,3 +787,22 @@ def test_first_status_event_without_a_command_is_still_a_replay() -> None:
     c._status_subscribed_at = time.monotonic()
     c._on_machine_status(0, bytearray([0x02, 0x02]))
     assert c._paused is False
+def test_reset_requests_control_again_before_the_next_command() -> None:
+    pad = Pad(pause_before_stop=False, speed=2.0)
+    pad.c._write_control_point = pad._write  # type: ignore[method-assign]
+    requested: list[int] = []
+
+    async def request_control() -> None:
+        requested.append(1)
+        pad.c._has_control = True
+
+    pad.c._request_control = request_control  # type: ignore[method-assign]
+
+    async def run() -> None:
+        assert await pad.c.reset() is True
+        assert pad.c._has_control is False
+        await pad.c.set_target_speed(1.5)
+
+    asyncio.run(run())
+    assert requested == [1]
+    assert pad.c._has_control is True

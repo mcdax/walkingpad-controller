@@ -1566,7 +1566,12 @@ class FTMSController:
         """Reset the fitness machine."""
         async with self._op_lock:
             await self._ensure_control_requested()
-            return await self._write_control_point(FTMSOpcode.RESET)
+            ok = await self._write_control_point(FTMSOpcode.RESET)
+            if ok:
+                # FTMS: a Reset revokes control. Without a new REQUEST_CONTROL
+                # the KS-HD-Z1D leaves every later command unanswered.
+                self._has_control = False
+            return ok
 
     async def set_target_speed(self, speed_kmh: float) -> bool:
         """Set the target speed in km/h.
