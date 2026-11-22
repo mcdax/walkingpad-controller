@@ -36,7 +36,7 @@ from .models import DeviceCapabilities, SpeedRange, TreadmillStatus
 from .sperax import SperaxController
 from .wilink import WiLinkController
 
-__version__ = "0.6.2"
+__version__ = "1.0.0"
 
 __all__ = [
     # Main controller

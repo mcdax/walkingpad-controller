@@ -184,6 +184,9 @@ Multi-step commands (`start`, `stop`, `set_speed`, …) are serialised within a 
 ### BLE Connection Drops
 KingSmith FTMS devices may occasionally drop the connection, typically around a cold start. The library does not reconnect or replay commands on its own: call `connect()` again (Home Assistant's integration does this) and re-send the speed if needed. After a reconnect the cached speed is reset to 0 until fresh telemetry arrives.
 
+### Paused Session After Connecting
+Connecting to a paused KS-HD-Z1D brings no status event. The library reads the first Treadmill Data frame instead: 0 km/h with elapsed time kept means a paused session (`BeltState.PAUSED`), 0 s means stopped.
+
 ### Remote Control and ESPHome Bluetooth Proxies
 ESPHome Bluetooth proxies (as used by Home Assistant) keep the link at an 8.75-11.25 ms connection interval. At that interval the KS-HD-Z1D ignores its own remote control while connected. When connected through such a proxy, the library asks for 30-50 ms (the BlueZ default) right after connecting; the remote then keeps working. Older proxy firmware without this feature ignores the request.
 
