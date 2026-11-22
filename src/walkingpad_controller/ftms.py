@@ -164,6 +164,10 @@ class FTMSController:
         # When 0x2ADA was subscribed (monotonic). Only a first event that
         # arrives shortly after subscribing is treated as a stale replay.
         self._status_subscribed_at: float | None = None
+        # FM Status (opcode, param) the last Control Point command would
+        # cause; lets the first event after subscribe through if it answers
+        # a command rather than replaying old state.
+        self._last_cp_status: tuple[int, int | None] | None = None
 
         # Fitness Machine Status (2ADA) ack — used on the vendor pre-amble
         # path, where most Control Point opcodes are acknowledged via a
@@ -416,6 +420,7 @@ class FTMSController:
         # replay is also dropped.
         self._machine_status_first_event_seen = False
         self._status_subscribed_at = None
+        self._last_cp_status = None
         self._status.speed = 0.0
         self._status.belt_state = BeltState.STOPPED
         self._wake_waiters()
@@ -807,7 +812,7 @@ class FTMSController:
             self._session_end_events += 1
             self._session_end_event.set()
 
-        if self._is_stale_status_replay(opcode):
+        if self._is_stale_status_replay(opcode, data):
             return
 
         # Wake any pending command waiter that's expecting this opcode.
@@ -830,7 +835,7 @@ class FTMSController:
         self._status.timestamp = time.time()
         self._notify_status()
 
-    def _is_stale_status_replay(self, opcode: int) -> bool:
+    def _is_stale_status_replay(self, opcode: int, data: bytearray) -> bool:
         """Return True for the firmware's replay of its state on subscribe.
 
         The first 2ADA event after subscribing is often the device replaying
@@ -862,12 +867,39 @@ class FTMSController:
                 opcode,
             )
             return False
+        if self._matches_last_command(opcode, data):
+            # Devices without the pre-amble ack on the Control Point, so no
+            # ack opcode is armed; the event answering a command sent
+            # right after connect (e.g. PAUSE) is still real.
+            _LOGGER.debug(
+                "FTMS: First 2ADA event after subscribe answers the last "
+                "command (opcode 0x%02x) — treating as real, not stale replay",
+                opcode,
+            )
+            return False
         _LOGGER.debug(
             "FTMS: Ignoring first 2ADA event after subscribe "
             "(opcode 0x%02x, no matching pending command)",
             opcode,
         )
         return True
+
+    def _note_cp_command(self, opcode: FTMSOpcode, params: bytes) -> None:
+        """Remember which FM Status event the command just sent would cause."""
+        status_opcode = _CP_TO_STATUS_ACK.get(opcode)
+        if status_opcode is None:
+            return
+        param = params[0] if opcode == FTMSOpcode.STOP_OR_PAUSE and params else None
+        self._last_cp_status = (status_opcode, param)
+
+    def _matches_last_command(self, opcode: int, data: bytearray) -> bool:
+        """Return whether a status event is the effect of the last command."""
+        if self._last_cp_status is None:
+            return False
+        expected_opcode, expected_param = self._last_cp_status
+        if opcode != expected_opcode:
+            return False
+        return expected_param is None or (len(data) >= 2 and data[1] == expected_param)
 
     def _apply_machine_status(self, opcode: int, data: bytearray) -> None:
         """Update pause/belt state (and log) for one FM Status event."""
@@ -1002,6 +1034,7 @@ class FTMSController:
         if self._capabilities.has_vendor_preamble:
             await self._write_vendor_preamble(client)
         expected_status_opcode = self._arm_status_ack(opcode, params)
+        self._note_cp_command(opcode, params)
 
         command = bytes([opcode]) + params
         _LOGGER.debug("FTMS: Sending control point command: %s", command.hex())
