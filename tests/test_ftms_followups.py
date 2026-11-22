@@ -760,3 +760,24 @@ def test_subscription_table_matches_the_resubscribe_list(monkeypatch) -> None:
     c._client = SimpleNamespace(is_connected=True, start_notify=start_notify)  # type: ignore[assignment]
     asyncio.run(c._subscribe_notifications())
     assert tuple(order) == ftms._CONNECT_SUBSCRIPTION_UUIDS
+
+
+def test_reset_requests_control_again_before_the_next_command() -> None:
+    pad = Pad(pause_before_stop=False, speed=2.0)
+    pad.c._write_control_point = pad._write  # type: ignore[method-assign]
+    requested: list[int] = []
+
+    async def request_control() -> None:
+        requested.append(1)
+        pad.c._has_control = True
+
+    pad.c._request_control = request_control  # type: ignore[method-assign]
+
+    async def run() -> None:
+        assert await pad.c.reset() is True
+        assert pad.c._has_control is False
+        await pad.c.set_target_speed(1.5)
+
+    asyncio.run(run())
+    assert requested == [1]
+    assert pad.c._has_control is True
