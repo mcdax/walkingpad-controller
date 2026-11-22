@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from walkingpad_controller import FTMSController
-from walkingpad_controller.const import FTMSOpcode, FTMSStopPauseParam
+from walkingpad_controller.const import BeltState, FTMSOpcode, FTMSStopPauseParam
 from walkingpad_controller.ftms import _CPResult
 
 PAUSE = (FTMSOpcode.STOP_OR_PAUSE, bytes([FTMSStopPauseParam.PAUSE]))
@@ -128,6 +128,29 @@ def test_regular_ftms_device_reports_rejected_stop() -> None:
     pad.results[STOP] = [False]
     assert pad.stop() is False
     assert pad.sent == [STOP]
+
+
+def test_stop_from_pause_reports_stopped_without_session_end_event() -> None:
+    # KS-HD-Z1D: STOP while paused is acked, followed by FM Status RESET
+    # (0x01) rather than 02 01, and Treadmill Data keeps reporting 0 km/h.
+    pad = Pad(pause_before_stop=False, speed=0.0)
+    pad.c._paused = True
+    pad.c._status.belt_state = BeltState.PAUSED
+    seen: list[BeltState] = []
+    pad.c.register_status_callback(lambda st: seen.append(st.belt_state))
+    assert pad.stop() is True
+    assert pad.c._paused is False
+    assert pad.c.status.belt_state is BeltState.STOPPED
+    assert seen[-1] is BeltState.STOPPED
+
+
+def test_rejected_stop_from_pause_stays_paused() -> None:
+    pad = Pad(pause_before_stop=False, speed=0.0)
+    pad.c._paused = True
+    pad.c._status.belt_state = BeltState.PAUSED
+    pad.results[STOP] = [False]
+    assert pad.stop() is False
+    assert pad.c.status.belt_state is BeltState.PAUSED
 
 
 # --- pause-before-stop devices -------------------------------------------

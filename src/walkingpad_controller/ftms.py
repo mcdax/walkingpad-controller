@@ -1355,6 +1355,20 @@ class FTMSController:
         The R3 occasionally drops the Control Point indication even though
         the command took effect, while still emitting FM Status ``02 01``.
         """
+        if not await self._send_stop_command():
+            return False
+        # The session has ended. Not every device says so: the KS-HD-Z1D
+        # answers a STOP from pause with FM Status RESET (0x01) instead of
+        # 02 01, and at 0 km/h no Treadmill Data frame would correct a
+        # stale PAUSED either.
+        if self._paused:
+            self._paused = False
+            if self._status.speed == 0:
+                self._status.belt_state = BeltState.STOPPED
+                self._notify_status()
+        return True
+
+    async def _send_stop_command(self) -> bool:
         ends_before = self._session_end_events
         self._session_end_event.clear()
         result = await self._write_control_point_result(
