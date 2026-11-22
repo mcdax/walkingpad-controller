@@ -603,6 +603,16 @@ class WalkingPadController:
         else:
             self._connected = False
 
+    def set_name(self, name: str) -> None:
+        """Set the name used when the BLEDevice carries none.
+
+        It is the fallback for name-based protocol detection on the next
+        ``connect()`` (e.g. a name Home Assistant learned from a scan
+        response after setup). The live ``BLEDevice.name`` still wins.
+        """
+        if name:
+            self._name = name
+
     def update_ble_device(self, ble_device: BLEDevice) -> None:
         """Update the BLE device reference (e.g., after rediscovery).
 
