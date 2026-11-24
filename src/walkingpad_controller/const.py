@@ -276,6 +276,13 @@ FTMS_NAME_PREFIXES = ("KS-HD-", "KS-MC21-", "KS-SMC21C-", "ZP-ZEALR1-", "KS-AP-"
 # Verified: KS-AP-RQ3 (KingSmith R3, model KS-R3Q, firmware V74.02.23).
 FTMS_PAUSE_BEFORE_STOP_PREFIXES = ("KS-AP-",)
 
+# FTMS devices whose buzzer can be switched over the supplement channel.
+# Unlocking that channel stops the idle Treadmill Data, which the R3
+# (KS-AP-*) stop sequence relies on, so the R3 is left out.
+#
+# Verified: KS-HD-Z1D (firmware V0.0.6).
+FTMS_SOUND_PREFIXES = ("KS-HD-",)
+
 # BLE name prefixes for the Sperax / wi-linktech (WLT6200) vendor protocol.
 # The P3 Max advertises as "SPERAX_P3MAX". Keep this specific rather than a
 # bare "SPERAX_" prefix: other Sperax-branded pads (e.g. the RM-01, which
