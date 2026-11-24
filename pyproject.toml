@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "walkingpad-controller"
-version = "1.0.0"
+version = "1.1.0"
 description = "Python library for controlling KingSmith WalkingPad treadmills over BLE (FTMS and legacy WiLink protocols)"
 readme = "README.md"
 license = "MIT"

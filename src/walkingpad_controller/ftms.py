@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+import random
 import struct
 import time
 from typing import Callable, NamedTuple
@@ -35,15 +36,19 @@ from bleak.exc import BleakError
 from bleak_retry_connector import establish_connection
 
 from ._callbacks import fire_callbacks
+from . import supplement
 from .const import (
     FITNESS_MACHINE_STATUS_UUID,
     FTMS_CONTROL_POINT_UUID,
     FTMS_FEATURE_UUID,
     FTMS_PAUSE_BEFORE_STOP_PREFIXES,
+    FTMS_SOUND_PREFIXES,
     KINGSMITH_VENDOR_PREAMBLE_PAYLOAD,
     KINGSMITH_VENDOR_PREAMBLE_UUID,
     SOFTWARE_REVISION_UUID,
+    SUPPLEMENT_NOTIFY_UUID,
     SUPPLEMENT_SERVICE_UUID,
+    SUPPLEMENT_WRITE_UUID,
     SUPPORTED_SPEED_RANGE_UUID,
     TRAINING_STATUS_UUID,
     TREADMILL_DATA_UUID,
@@ -71,6 +76,9 @@ _RELAXED_CONN_PARAMS = (24, 40, 0, 400)
 
 # How long a Control Point write waits for its acknowledgement. On the vendor
 # pre-amble path this replaces (not caps) the caller's timeout.
+# How long to wait for a reply on the supplement channel.
+_SUPPLEMENT_TIMEOUT = 3.0
+
 _CP_ACK_TIMEOUT = 5.0
 _CP_ACK_TIMEOUT_PREAMBLE = 3.0
 
@@ -87,6 +95,11 @@ _CP_TO_STATUS_ACK: dict[int, int] = {
     FTMSOpcode.SET_TARGET_SPEED: FitnessMachineStatusOpcode.TARGET_SPEED_CHANGED,
     FTMSOpcode.SET_TARGET_INCLINATION: FitnessMachineStatusOpcode.TARGET_INCLINATION_CHANGED,
 }
+
+
+def supports_sound(name: str | None) -> bool:
+    """Whether the buzzer of the device with this BLE name can be switched."""
+    return (name or "").upper().startswith(FTMS_SOUND_PREFIXES)
 
 
 def _needs_pause_before_stop(name: str | None) -> bool:
@@ -155,6 +168,13 @@ class FTMSController:
         self._capabilities = DeviceCapabilities()
         self._status_callbacks: list[Callable[[TreadmillStatus], None]] = []
         self._disconnect_callbacks: list[Callable[[], None]] = []
+
+        # Supplement channel (see _supplement_request)
+        self._ble_name = ""
+        self._supplement_lock = asyncio.Lock()
+        self._supplement_unlocked = False
+        self._supplement_reply: asyncio.Future[bytes] | None = None
+        self._supplement_expected: bytes = b""
 
         # Control point indication response
         self._cp_response_event = asyncio.Event()
@@ -365,6 +385,8 @@ class FTMSController:
                 "FTMS: %s needs PAUSE before STOP", ble_device.name or name
             )
 
+        self._ble_name = ble_device.name or name or ""
+
         # Discover services so we can detect supplement / vendor pre-amble
         # characteristics. Local (BlueZ-cached) — no extra GATT round-trips.
         await self._discover_services()
@@ -437,6 +459,9 @@ class FTMSController:
         changed = self._status.speed > 0 or self._status.belt_state != BeltState.STOPPED
         self._connected = False
         self._has_control = False
+        self._supplement_unlocked = False
+        if self._supplement_reply is not None and not self._supplement_reply.done():
+            self._supplement_reply.cancel()
         self._paused = False
         self._stopping = False
         # Re-arm the replay check so the next connection's stale 2ADA
@@ -1717,6 +1742,110 @@ class FTMSController:
             FTMSOpcode.STOP_OR_PAUSE,
             bytes([FTMSStopPauseParam.PAUSE]),
         )
+
+    def _on_supplement(self, sender: int, data: bytearray) -> None:
+        """Hand a supplement notification to the request waiting for it."""
+        _LOGGER.debug("FTMS: Supplement notification: %s", data.hex())
+        reply = self._supplement_reply
+        if (
+            reply is not None
+            and not reply.done()
+            and bytes(data[:2]) == self._supplement_expected
+        ):
+            reply.set_result(bytes(data))
+
+    async def _supplement_request(self, request: bytes, reply_flags: int) -> bytes:
+        """Write a supplement frame and return the matching reply.
+
+        Caller holds `_supplement_lock`. Raises BleakError without a reply.
+        """
+        client = self._client
+        if client is None or not self.connected:
+            raise BleakError("FTMS: not connected")
+        reply: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
+        self._supplement_expected = bytes((request[0], reply_flags))
+        self._supplement_reply = reply
+        try:
+            await client.write_gatt_char(SUPPLEMENT_WRITE_UUID, request, response=True)
+            # asyncio.wait, unlike wait_for, tells a cancelled reply (link
+            # lost) from a cancelled caller.
+            await asyncio.wait({reply}, timeout=_SUPPLEMENT_TIMEOUT)
+            if not reply.done() or reply.cancelled():
+                raise BleakError("FTMS: no reply on the supplement channel")
+            return reply.result()
+        finally:
+            self._supplement_reply = None
+
+    async def _unlock_supplement(self) -> None:
+        """Unlock the supplement channel, once per connection.
+
+        Not done while connecting: an unlocked device sends no Treadmill
+        Data while the belt stands still.
+        """
+        if self._supplement_unlocked:
+            return
+        client = self._client
+        if client is None or not self.connected:
+            raise BleakError("FTMS: not connected")
+        await client.start_notify(SUPPLEMENT_NOTIFY_UUID, self._on_supplement)
+        try:
+            await self._supplement_request(
+                supplement.unlock_frame(self._ble_name, random.randrange(255)),
+                supplement.FLAG_GET_REPLY,
+            )
+        except BaseException:
+            # Let the next attempt subscribe again.
+            if self._client is client and self.connected:
+                try:
+                    await client.stop_notify(SUPPLEMENT_NOTIFY_UUID)
+                except Exception as err:
+                    _LOGGER.debug("FTMS: stop_notify failed: %s", err)
+            raise
+        # The link may have dropped (and come back) since the reply arrived.
+        if self._client is not client or not self.connected:
+            raise BleakError("FTMS: link lost while unlocking")
+        self._supplement_unlocked = True
+
+    async def _read_other_switch(self) -> int:
+        """Read the `otherSwitch` property; caller holds `_supplement_lock`."""
+        reply = await self._supplement_request(
+            supplement.GET_PROPERTIES, supplement.FLAG_GET_REPLY
+        )
+        return supplement.parse_properties(reply)[supplement.PROPERTY_OTHER_SWITCH]
+
+    @property
+    def supports_sound(self) -> bool:
+        """Whether the connected device's buzzer can be switched."""
+        return self._capabilities.has_supplement and supports_sound(self._ble_name)
+
+    async def set_sound(self, on: bool) -> bool:
+        """Turn the buzzer on or off.
+
+        Returns True once the device reports the requested state.
+        """
+        if not self.supports_sound:
+            _LOGGER.warning("FTMS: Sound control not supported on this device")
+            return False
+        async with self._supplement_lock:
+            try:
+                await self._unlock_supplement()
+                value = await self._read_other_switch()
+                # Keep the other bits; only the sound bit is understood.
+                wanted = value & ~supplement.OTHER_SWITCH_SOUND
+                if on:
+                    wanted |= supplement.OTHER_SWITCH_SOUND
+                if wanted == value:
+                    return True
+                await self._supplement_request(
+                    supplement.set_property_frame(
+                        supplement.PROPERTY_OTHER_SWITCH, wanted
+                    ),
+                    supplement.FLAG_SET_REPLY,
+                )
+                return await self._read_other_switch() == wanted
+            except (BleakError, ValueError, KeyError) as err:
+                _LOGGER.warning("FTMS: Could not switch the sound: %s", err)
+                return False
 
     async def reset(self) -> bool:
         """Reset the fitness machine."""

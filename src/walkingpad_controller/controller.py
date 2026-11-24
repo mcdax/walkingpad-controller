@@ -50,7 +50,7 @@ from .const import (
     OperatingMode,
     ProtocolType,
 )
-from .ftms import FTMSController
+from .ftms import FTMSController, supports_sound
 from .models import TreadmillStatus
 
 _LOGGER = logging.getLogger(__name__)
@@ -557,6 +557,25 @@ class WalkingPadController:
             return await self._sperax.set_vibration(level)
 
         _LOGGER.warning("Vibration control not supported on this device")
+        return False
+
+    @property
+    def supports_sound(self) -> bool:
+        """Whether the buzzer can be switched (from the BLE name, also offline)."""
+        return supports_sound(self._ble_device.name or self._name)
+
+    async def set_sound(self, on: bool) -> bool:
+        """Turn the buzzer on or off.
+
+        Only KS-HD-* FTMS devices support this today; others return False.
+
+        Returns:
+            True once the device reports the requested state.
+        """
+        if self._ftms:
+            return await self._ftms.set_sound(on)
+
+        _LOGGER.warning("Sound control not supported on this device")
         return False
 
     async def switch_mode(self, mode: OperatingMode) -> bool:

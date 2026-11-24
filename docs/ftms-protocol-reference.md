@@ -366,13 +366,15 @@ R3 property values seen (`72 80` reply):
 | `00 00 00 00 00` | ignored |
 | any single byte altered | ignored |
 
-So tokens carry an integrity check, but they aren't bound to a connection and don't expire.
-- ❓ How KS Fit derives the token.
-- ❓ Whether tokens are per-device.
+✅ **Derivation** (`unlockCmd` in KS Fit 5.9.10; matches both R3 tokens and works on a KS-HD-Z1D): `[r] [u32le(key + r)]`, with a random byte `r` (0–254) and `key` = the last four characters of the BLE name read as a little-endian integer (`-RQ3`, `-Z1D`). Tokens are therefore per model name, aren't bound to a connection and don't expire.
 
 #### 5.1.2 Side effect: Treadmill Data cadence ✅ (R3)
 
 **Before** the handshake, Treadmill Data arrives at 1 Hz even when idle. **After** the handshake, it arrives only while the belt moves, plus a final 0 km/h frame. Idle gaps of 5–8 s were seen in both KS Fit and our own sessions. Don't use idle Treadmill Data as a link heartbeat after handshaking.
+
+#### 5.1.3 Buzzer ✅ (KS-HD-Z1D, FW V0.0.6)
+
+Bit `0x02` of `otherSwitch` (id 8) is the buzzer: `3` = on, `1` = off. Set: `72 01 03 08 03 00 81` / `72 01 03 08 01 00 7f`; the pad replies `72 81 02 08 00 fd` and pushes `72 50 03 08 <value> <chk>`. The Z1D shows the same Treadmill Data side effect as the R3 (§5.1.2).
 
 ### 5.2 Method inventory
 
