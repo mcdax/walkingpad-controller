@@ -46,6 +46,11 @@ def set_property_frame(prop: int, value: int) -> bytes:
     )
 
 
+def set_accepted(reply: bytes) -> bool:
+    """Whether a set-property reply (id, status) reports success."""
+    return len(reply) >= 5 and reply[4] == 0
+
+
 def parse_properties(data: bytes) -> dict[int, int]:
     """Return the properties of a get-properties reply.
 

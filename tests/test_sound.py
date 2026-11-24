@@ -126,7 +126,7 @@ def test_no_reply_fails_and_can_be_retried(monkeypatch) -> None:
 
     async def run():
         assert await c.set_sound(True) is False
-        assert pad.subscribed == 0
+        assert pad.subscribed == 1
         pad.silent = False
         assert await c.set_sound(True) is True
 
@@ -177,3 +177,53 @@ def test_drop_right_after_the_unlock_reply_is_not_remembered() -> None:
     pad.write_gatt_char = write  # type: ignore[method-assign]
     assert asyncio.run(c.set_sound(True)) is False
     assert c._supplement_unlocked is False
+
+
+def _scripted(pad, monkeypatch, drop):
+    """Drop the replies to the n-th writes listed in ``drop``."""
+    monkeypatch.setattr(ftms, "_SUPPLEMENT_TIMEOUT", 0.01)
+    inner, count = pad.write_gatt_char, [0]
+
+    async def write(uuid, data, response):
+        count[0] += 1
+        pad.silent = count[0] in drop
+        await inner(uuid, data, response)
+        if pad.silent and data[:2] == h("7201"):
+            pad.value = data[4]  # applied, only the reply is lost
+
+    pad.write_gatt_char = write
+
+
+def test_relocked_channel_is_unlocked_again(monkeypatch) -> None:
+    pad = FakePad(1)
+    _scripted(pad, monkeypatch, {5})  # 1 unlock, 2 read, 3 set, 4 read, 5 read
+    c = controller(pad)
+
+    async def run():
+        assert await c.set_sound(True)
+        return await c.set_sound(False)
+
+    assert asyncio.run(run()) is True
+    assert [f[0] for f in pad.written].count(0x71) == 2
+    assert pad.subscribed == 1
+
+
+def test_acknowledged_set_counts_without_readback(monkeypatch) -> None:
+    pad = FakePad(1)
+    _scripted(pad, monkeypatch, {4, 5, 6})
+    assert asyncio.run(controller(pad).set_sound(True)) is True
+    assert pad.value == 3
+
+
+def test_refusal_status_fails_at_once() -> None:
+    pad = FakePad(1)
+    inner = pad.write_gatt_char
+
+    async def write(uuid, data, response):
+        if data[:2] == h("7201"):
+            pad.handler(0, bytearray(h("728102070702")))
+            return
+        await inner(uuid, data, response)
+
+    pad.write_gatt_char = write
+    assert asyncio.run(controller(pad).set_sound(True)) is False

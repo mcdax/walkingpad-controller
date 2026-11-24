@@ -76,11 +76,11 @@ _RELAXED_CONN_PARAMS = (24, 40, 0, 400)
 
 # How long a Control Point write waits for its acknowledgement. On the vendor
 # pre-amble path this replaces (not caps) the caller's timeout.
-# How long to wait for a reply on the supplement channel.
-_SUPPLEMENT_TIMEOUT = 3.0
-
 _CP_ACK_TIMEOUT = 5.0
 _CP_ACK_TIMEOUT_PREAMBLE = 3.0
+
+# How long to wait for a reply on the supplement channel.
+_SUPPLEMENT_TIMEOUT = 3.0
 
 # How long start() waits for the belt to move after START_OR_RESUME.
 _START_MOTION_TIMEOUT = 15.0
@@ -172,6 +172,7 @@ class FTMSController:
         # Supplement channel (see _supplement_request)
         self._ble_name = ""
         self._supplement_lock = asyncio.Lock()
+        self._supplement_subscribed = False
         self._supplement_unlocked = False
         self._supplement_reply: asyncio.Future[bytes] | None = None
         self._supplement_expected: bytes = b""
@@ -459,6 +460,7 @@ class FTMSController:
         changed = self._status.speed > 0 or self._status.belt_state != BeltState.STOPPED
         self._connected = False
         self._has_control = False
+        self._supplement_subscribed = False
         self._supplement_unlocked = False
         if self._supplement_reply is not None and not self._supplement_reply.done():
             self._supplement_reply.cancel()
@@ -1009,7 +1011,7 @@ class FTMSController:
                     # sets STOPPED. At rest (e.g. ending a paused session)
                     # no further frame may come, so set it here.
                     if self._status.speed == 0:
-                        self._status.belt_state = BeltState.STOPPED
+                        self._end_session_at_rest()
                 elif data[1] == FTMSStopPauseParam.PAUSE:
                     _LOGGER.info("FTMS: Treadmill paused by user")
                     self._paused = True
@@ -1017,6 +1019,13 @@ class FTMSController:
                     # ACTIVE and switches to PAUSED at 0 km/h.
                     if self._status.speed == 0:
                         self._status.belt_state = BeltState.PAUSED
+        elif opcode == FitnessMachineStatusOpcode.RESET:
+            # The KS-HD-Z1D ends a paused session this way, both after a
+            # STOP and with its idle reset.
+            if self._paused and self._status.speed == 0:
+                _LOGGER.info("FTMS: Paused session ended by a reset")
+                self._paused = False
+                self._end_session_at_rest()
         elif opcode == FitnessMachineStatusOpcode.STOPPED_BY_SAFETY_KEY:
             _LOGGER.info("FTMS: Treadmill stopped by safety key")
             self._paused = False
@@ -1592,9 +1601,24 @@ class FTMSController:
         if self._paused:
             self._paused = False
             if self._status.speed == 0:
-                self._status.belt_state = BeltState.STOPPED
+                self._end_session_at_rest()
                 self._notify_status()
         return True
+
+    def _end_session_at_rest(self) -> None:
+        """Reflect a session that ended at 0 km/h in the status.
+
+        No Treadmill Data may follow (an unlocked device sends none while
+        idle), so clear the counters here. The timestamp must advance:
+        consumers drop updates that aren't newer.
+        """
+        self._status.belt_state = BeltState.STOPPED
+        self._status.distance = 0
+        self._status.duration = 0
+        self._status.steps = 0
+        self._status.calories = 0
+        self._status.calories_per_hour = 0
+        self._status.timestamp = max(time.time(), self._status.timestamp + 1e-3)
 
     async def _send_stop_command(self) -> bool:
         ends_before = self._session_end_events
@@ -1787,30 +1811,41 @@ class FTMSController:
         client = self._client
         if client is None or not self.connected:
             raise BleakError("FTMS: not connected")
-        await client.start_notify(SUPPLEMENT_NOTIFY_UUID, self._on_supplement)
-        try:
-            await self._supplement_request(
-                supplement.unlock_frame(self._ble_name, random.randrange(255)),
-                supplement.FLAG_GET_REPLY,
-            )
-        except BaseException:
-            # Let the next attempt subscribe again.
-            if self._client is client and self.connected:
-                try:
-                    await client.stop_notify(SUPPLEMENT_NOTIFY_UUID)
-                except Exception as err:
-                    _LOGGER.debug("FTMS: stop_notify failed: %s", err)
-            raise
+        if not self._supplement_subscribed:
+            await client.start_notify(SUPPLEMENT_NOTIFY_UUID, self._on_supplement)
+            if self._client is not client or not self.connected:
+                raise BleakError("FTMS: link lost while subscribing")
+            self._supplement_subscribed = True
+        await self._supplement_request(
+            supplement.unlock_frame(self._ble_name, random.randrange(255)),
+            supplement.FLAG_GET_REPLY,
+        )
         # The link may have dropped (and come back) since the reply arrived.
         if self._client is not client or not self.connected:
             raise BleakError("FTMS: link lost while unlocking")
         self._supplement_unlocked = True
 
     async def _read_other_switch(self) -> int:
-        """Read the `otherSwitch` property; caller holds `_supplement_lock`."""
-        reply = await self._supplement_request(
-            supplement.GET_PROPERTIES, supplement.FLAG_GET_REPLY
-        )
+        """Read the `otherSwitch` property; caller holds `_supplement_lock`.
+
+        Without a reply the device may have locked the channel again (e.g.
+        with its idle reset), so unlock and try once more.
+        """
+        was_unlocked = self._supplement_unlocked
+        await self._unlock_supplement()
+        try:
+            reply = await self._supplement_request(
+                supplement.GET_PROPERTIES, supplement.FLAG_GET_REPLY
+            )
+        except BleakError:
+            if not was_unlocked or not self.connected:
+                raise
+            _LOGGER.debug("FTMS: No supplement reply; unlocking again")
+            self._supplement_unlocked = False
+            await self._unlock_supplement()
+            reply = await self._supplement_request(
+                supplement.GET_PROPERTIES, supplement.FLAG_GET_REPLY
+            )
         return supplement.parse_properties(reply)[supplement.PROPERTY_OTHER_SWITCH]
 
     @property
@@ -1821,14 +1856,13 @@ class FTMSController:
     async def set_sound(self, on: bool) -> bool:
         """Turn the buzzer on or off.
 
-        Returns True once the device reports the requested state.
+        Returns True once the device confirmed the requested state.
         """
         if not self.supports_sound:
             _LOGGER.warning("FTMS: Sound control not supported on this device")
             return False
         async with self._supplement_lock:
             try:
-                await self._unlock_supplement()
                 value = await self._read_other_switch()
                 # Keep the other bits; only the sound bit is understood.
                 wanted = value & ~supplement.OTHER_SWITCH_SOUND
@@ -1836,13 +1870,25 @@ class FTMSController:
                     wanted |= supplement.OTHER_SWITCH_SOUND
                 if wanted == value:
                     return True
-                await self._supplement_request(
+                reply = await self._supplement_request(
                     supplement.set_property_frame(
                         supplement.PROPERTY_OTHER_SWITCH, wanted
                     ),
                     supplement.FLAG_SET_REPLY,
                 )
-                return await self._read_other_switch() == wanted
+                if not supplement.set_accepted(reply):
+                    _LOGGER.warning("FTMS: Device refused the sound change")
+                    return False
+                try:
+                    # Twice: the first may get a late reply to an earlier read.
+                    return (
+                        await self._read_other_switch() == wanted
+                        or await self._read_other_switch() == wanted
+                    )
+                except (BleakError, ValueError, KeyError) as err:
+                    # The device acknowledged the change; that counts.
+                    _LOGGER.debug("FTMS: Could not read the sound back: %s", err)
+                    return True
             except (BleakError, ValueError, KeyError) as err:
                 _LOGGER.warning("FTMS: Could not switch the sound: %s", err)
                 return False
