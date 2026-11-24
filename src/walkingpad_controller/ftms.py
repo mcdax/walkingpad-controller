@@ -1005,13 +1005,18 @@ class FTMSController:
             if len(data) >= 2:
                 if data[1] == FTMSStopPauseParam.STOP:
                     _LOGGER.info("FTMS: Treadmill stopped by user")
+                    was_paused = self._paused
                     self._paused = False
                     self._stopping = self._status.speed > 0
                     # While moving, Treadmill Data with speed=0 follows and
                     # sets STOPPED. At rest (e.g. ending a paused session)
                     # no further frame may come, so set it here.
                     if self._status.speed == 0:
-                        self._end_session_at_rest()
+                        self._status.belt_state = BeltState.STOPPED
+                        # Only a paused session is known to be at rest; a
+                        # cached 0 km/h may predate a start.
+                        if was_paused:
+                            self._end_session_at_rest()
                 elif data[1] == FTMSStopPauseParam.PAUSE:
                     _LOGGER.info("FTMS: Treadmill paused by user")
                     self._paused = True

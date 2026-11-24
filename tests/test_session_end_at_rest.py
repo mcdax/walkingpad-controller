@@ -57,3 +57,10 @@ def test_reset_while_moving_changes_nothing() -> None:
     c._status.speed, c._status.belt_state = 2.0, BeltState.ACTIVE
     c._on_machine_status(0, bytearray(b"\x01"))
     assert c._status.belt_state == BeltState.ACTIVE and c._status.duration == 184
+
+
+def test_stop_right_after_a_physical_resume_keeps_the_counters() -> None:
+    c, _ = paused()
+    c._on_machine_status(0, bytearray(b"\x04"))  # resumed, no frame yet
+    c._on_machine_status(0, bytearray(b"\x02\x01"))
+    assert c._status.duration == 184
