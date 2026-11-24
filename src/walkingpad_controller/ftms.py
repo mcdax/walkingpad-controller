@@ -1784,9 +1784,10 @@ class FTMSController:
         """
         if self._supplement_unlocked:
             return
-        if self._client is None or not self.connected:
+        client = self._client
+        if client is None or not self.connected:
             raise BleakError("FTMS: not connected")
-        await self._client.start_notify(SUPPLEMENT_NOTIFY_UUID, self._on_supplement)
+        await client.start_notify(SUPPLEMENT_NOTIFY_UUID, self._on_supplement)
         try:
             await self._supplement_request(
                 supplement.unlock_frame(self._ble_name, random.randrange(255)),
@@ -1794,12 +1795,15 @@ class FTMSController:
             )
         except BaseException:
             # Let the next attempt subscribe again.
-            if self._client is not None and self.connected:
+            if self._client is client and self.connected:
                 try:
-                    await self._client.stop_notify(SUPPLEMENT_NOTIFY_UUID)
+                    await client.stop_notify(SUPPLEMENT_NOTIFY_UUID)
                 except Exception as err:
                     _LOGGER.debug("FTMS: stop_notify failed: %s", err)
             raise
+        # The link may have dropped (and come back) since the reply arrived.
+        if self._client is not client or not self.connected:
+            raise BleakError("FTMS: link lost while unlocking")
         self._supplement_unlocked = True
 
     async def _read_other_switch(self) -> int:

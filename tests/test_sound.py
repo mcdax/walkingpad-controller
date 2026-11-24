@@ -162,3 +162,18 @@ def test_controller_knows_support_from_the_name() -> None:
     assert make("KS-HD-Z1D", None).supports_sound
     assert make(None, "KS-HD-Z1D").supports_sound
     assert not make("KS-AP-RQ3", None).supports_sound
+
+
+def test_drop_right_after_the_unlock_reply_is_not_remembered() -> None:
+    pad = FakePad()
+    c = controller(pad)
+    inner = pad.write_gatt_char
+
+    async def write(uuid, data, response):
+        await inner(uuid, data, response)
+        if data[0] == 0x71:
+            c._reset_link_state()
+
+    pad.write_gatt_char = write  # type: ignore[method-assign]
+    assert asyncio.run(c.set_sound(True)) is False
+    assert c._supplement_unlocked is False
