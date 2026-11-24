@@ -100,6 +100,7 @@ The main entry point. Auto-detects protocol and delegates to the appropriate bac
 | `stop()` | End the session (counters reset) |
 | `pause()` | Pause, keeping the counters; the next `start()` resumes (WiLink: falls back to stop) |
 | `set_speed(speed_kmh)` | Set speed; starts the belt first if it isn't running. `0` pauses and never starts |
+| `set_sound(on)` | Buzzer on/off. KS-HD-* only (`supports_sound`). Afterwards the device sends no Treadmill Data while standing still, until the next connection |
 | `set_incline(step)` / `set_vibration(level)` | Sperax P3 Max only; `False` elsewhere |
 | `switch_mode(mode)` | Switch operating mode (auto/manual/standby; support varies by device) |
 | `register_status_callback(cb)` | Register a `TreadmillStatus` callback |
